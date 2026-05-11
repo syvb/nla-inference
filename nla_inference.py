@@ -96,6 +96,29 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 EXPLANATION_RE = re.compile(r"<explanation>\s*(.*?)\s*</explanation>", re.DOTALL)
 INJECT_PLACEHOLDER = "<INJECT>"
+
+
+def _flatten_chat_ids(out) -> list[int]:
+    """Compatibility shim for `tokenizer.apply_chat_template(tokenize=True)`.
+
+    In transformers <5 this returned a flat `list[int]`. In transformers 5.x
+    (Aug 2025+) it returns a `BatchEncoding` whose first row is an `Encoding`
+    object — `.ids` holds the int list. Accept both shapes.
+    """
+    if not out:
+        return []
+    if isinstance(out, list) and isinstance(out[0], int):
+        return out
+    # BatchEncoding[0] → Encoding (one row per message-list); .ids is the list.
+    first = out[0]
+    if hasattr(first, "ids"):
+        return list(first.ids)
+    if isinstance(first, list) and first and isinstance(first[0], int):
+        return list(first)
+    raise TypeError(
+        f"unexpected apply_chat_template return shape: {type(out).__name__}, "
+        f"first elem {type(first).__name__}"
+    )
 # Embedding weight key suffixes across HF architectures (Llama/Qwen/Mistral/
 # Gemma use embed_tokens; GPT-2 uses wte; Falcon uses word_embeddings).
 _EMBED_KEY_SUFFIXES = ("embed_tokens.weight", "wte.weight", "word_embeddings.weight")
@@ -188,6 +211,7 @@ def load_nla_config(
         [{"role": "user", "content": content}],
         tokenize=True, add_generation_prompt=True,
     )
+    ids = _flatten_chat_ids(ids)
     matches = [i for i, tok in enumerate(ids) if tok == cfg.injection_token_id]
     assert len(matches) == 1, (
         f"injection token appears {len(matches)}× in canonical prompt "
@@ -404,6 +428,7 @@ class NLAClient:
             [{"role": "user", "content": content}],
             tokenize=True, add_generation_prompt=True,
         )
+        input_ids = _flatten_chat_ids(input_ids)
         ids_t = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
 
         with torch.no_grad():
