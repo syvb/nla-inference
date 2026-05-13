@@ -102,14 +102,13 @@ def _flatten_chat_ids(out) -> list[int]:
     """Compatibility shim for `tokenizer.apply_chat_template(tokenize=True)`.
 
     In transformers <5 this returned a flat `list[int]`. In transformers 5.x
-    (Aug 2025+) it returns a `BatchEncoding` whose first row is an `Encoding`
-    object — `.ids` holds the int list. Accept both shapes.
+    it returns a `BatchEncoding` whose first row is an `Encoding` object —
+    `.ids` holds the int list. Accept both shapes.
     """
     if not out:
         return []
     if isinstance(out, list) and isinstance(out[0], int):
         return out
-    # BatchEncoding[0] → Encoding (one row per message-list); .ids is the list.
     first = out[0]
     if hasattr(first, "ids"):
         return list(first.ids)

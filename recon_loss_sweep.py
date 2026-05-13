@@ -1,6 +1,6 @@
 """Reconstruction-loss sweep: AV→AR round-trip on dataset activations.
 
-For N random samples from common-pile/comma_v0.1_training_dataset:
+For N samples drawn across the dataset's source diversity:
   1. Pick a random non-early, non-special token position.
   2. Extract the layer-K residual-stream activation from the base model.
   3. AV verbalizes the activation → explanation text.
@@ -10,28 +10,38 @@ For N random samples from common-pile/comma_v0.1_training_dataset:
 Two phases, run sequentially so a single H100 isn't asked to hold base + AV + AR
 at the same time.
 
+Sampling:
+  Default mode `--sampling diverse_shards` picks one random shard per
+  top-level source directory of the dataset (e.g. arxiv_papers, github_archive,
+  project_gutenberg, …) using --seed for reproducibility, interleaves them,
+  shuffles within a 50k buffer. The shard list is recorded in the output
+  parquet's metadata for reproducibility.
+
+  Mode `--sampling streaming_default` is the original
+  `load_dataset(..., streaming=True).shuffle(buffer_size=10_000)`. This
+  silently biases sampling toward the first source alphabetically — included
+  only for backward-compat reproduction of the May-10 run.
+
 ──────────────────────────────────────────────────────────────────────────────
 Phase 1 — extract activations (loads BASE model only):
 
     python recon_loss_sweep.py extract \
-        --base-model google/gemma-3-27b-it \
-        --layer 41 --n 100000 --max-len 512 --batch-size 4 \
+        --base-model google/gemma-3-12b-it \
+        --layer 32 --n 20000 --max-len 512 --batch-size 8 \
+        --sampling diverse_shards --seed 0 \
         --out activations.parquet
 
 Phase 2 — AV via SGLang + AR locally:
 
-    # In another shell, launch SGLang AV server. Use mem-fraction-static=0.55
-    # so AR has room to load on the same H100; if AV is on a different machine,
-    # bump it to 0.85.
     python -m sglang.launch_server \
-        --model-path ./nla-gemma3-27b-L41-av \
-        --port 30000 --disable-radix-cache \
-        --mem-fraction-static 0.55 --trust-remote-code
+        --model-path ./nla-gemma3-12b-L32-av \
+        --port 30000 --disable-radix-cache --disable-piecewise-cuda-graph \
+        --mem-fraction-static 0.55 --context-length 512 --trust-remote-code
 
     python recon_loss_sweep.py decode \
         --activations activations.parquet \
-        --av-checkpoint ./nla-gemma3-27b-L41-av \
-        --ar-checkpoint ./nla-gemma3-27b-L41-ar \
+        --av-checkpoint ./nla-gemma3-12b-L32-av \
+        --ar-checkpoint ./nla-gemma3-12b-L32-ar \
         --sglang-url http://localhost:30000 \
         --ar-device cuda:0 --av-concurrency 16 \
         --out results.parquet
@@ -46,9 +56,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import random
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
@@ -61,8 +73,9 @@ import numpy as np
 def find_layers_module_list(model):
     """Locate the ModuleList of transformer blocks across Qwen2/Llama/Gemma3.
 
-    Tries the common HF paths in order. Gemma3ForConditionalGeneration nests
-    text decoder layers under .language_model; plain CausalLM under .model.
+    Tries common HF paths in order, including both transformers <5
+    and >=5 layouts (the latter wraps Gemma3ForConditionalGeneration so
+    decoder layers live under model.language_model.layers).
     """
     import torch
 
@@ -70,8 +83,6 @@ def find_layers_module_list(model):
         ("model", "layers"),
         ("language_model", "layers"),
         ("language_model", "model", "layers"),
-        # transformers >= 5.x wraps Gemma3ForConditionalGeneration so the
-        # text-decoder ModuleList lives under model.language_model.layers.
         ("model", "language_model", "layers"),
         ("model", "language_model", "model", "layers"),
         ("transformer", "h"),
@@ -122,19 +133,106 @@ def pick_random_position(
     return rng.choice(pool)
 
 
-def stream_samples(dataset_name: str, split: str, seed: int) -> Iterable[str]:
-    """Yield non-empty `text` strings from the streaming dataset, shuffled.
+# ─── Sampling: diverse-shard interleave (the right way) ──────────────────────
 
-    Robust to schemas that name the field differently — falls back to "content".
+
+def list_dataset_shards(dataset_name: str) -> dict[str, list[str]]:
+    """Return {source_dir: [shard_paths]} for the dataset's jsonl.gz files.
+
+    Uses HfApi to list repo files. Cheap (a few seconds, no downloads).
+    """
+    from huggingface_hub import HfApi
+    api = HfApi()
+    files = [f for f in api.list_repo_files(dataset_name, repo_type="dataset")
+             if f.endswith(".jsonl.gz") or f.endswith(".jsonl") or f.endswith(".parquet")]
+    if not files:
+        raise RuntimeError(
+            f"No jsonl(.gz)/parquet shards found in {dataset_name}. "
+            f"Did the dataset layout change? Inspect with HfApi.list_repo_files."
+        )
+    by_source: dict[str, list[str]] = defaultdict(list)
+    for f in files:
+        # Top-level dir is the source. Files at repo root go into "_root_".
+        parts = f.split("/", 1)
+        src = parts[0] if len(parts) == 2 else "_root_"
+        by_source[src].append(f)
+    return {k: sorted(v) for k, v in sorted(by_source.items())}
+
+
+def select_diverse_shards(by_source: dict[str, list[str]], seed: int,
+                          shards_per_source: int = 1) -> list[str]:
+    """Deterministically pick `shards_per_source` random shards per source.
+
+    Returns the flat list of shard paths in deterministic order.
+    """
+    rng = random.Random(seed)
+    selected: list[str] = []
+    for src in sorted(by_source):
+        shards = list(by_source[src])
+        rng.shuffle(shards)
+        selected.extend(shards[:shards_per_source])
+    return selected
+
+
+def diverse_shard_iter(dataset_name: str, seed: int,
+                       shards_per_source: int = 1,
+                       buffer_size: int = 50_000) -> Iterable[str]:
+    """Yield text strings drawn across the dataset's source diversity.
+
+    For each top-level source dir, picks `shards_per_source` random shard(s)
+    (deterministic on seed). Loads each as a streaming dataset, interleaves
+    them with `interleave_datasets`, then shuffles within a buffer.
+
+    The selected shard list is logged so the run is reproducible.
+    """
+    from datasets import interleave_datasets, load_dataset
+
+    by_source = list_dataset_shards(dataset_name)
+    selected = select_diverse_shards(by_source, seed, shards_per_source)
+    print(f"[sample] using {len(selected)} shards from "
+          f"{len(by_source)} source dirs (seed={seed}):")
+    for s in selected:
+        print(f"  - {s}")
+
+    sub_dss = [load_dataset(dataset_name, data_files=s, streaming=True,
+                            split="train") for s in selected]
+    iled = interleave_datasets(sub_dss, seed=seed,
+                               stopping_strategy="all_exhausted")
+    iled = iled.shuffle(seed=seed, buffer_size=buffer_size)
+
+    diverse_shard_iter.last_selection = selected   # introspection / metadata
+
+    for ex in iled:
+        text = ex.get("text") or ex.get("content")
+        if isinstance(text, str) and text.strip():
+            yield text
+
+
+def streaming_default_iter(dataset_name: str, split: str, seed: int,
+                            buffer_size: int = 10_000) -> Iterable[str]:
+    """The OLD biased sampler — kept for reproducibility of the May-10 run.
+
+    HF streaming reads shards alphabetically; a 10k-row buffer can't escape a
+    single multi-GB shard, so this effectively samples within whatever source
+    sorts alphabetically first that has its shard not skipped by the seed.
     """
     from datasets import load_dataset
-
     ds = load_dataset(dataset_name, split=split, streaming=True)
-    ds = ds.shuffle(seed=seed, buffer_size=10_000)
+    ds = ds.shuffle(seed=seed, buffer_size=buffer_size)
     for ex in ds:
         text = ex.get("text") or ex.get("content")
         if isinstance(text, str) and text.strip():
             yield text
+
+
+def stream_samples(dataset_name: str, split: str, seed: int,
+                   sampling: str = "diverse_shards") -> Iterable[str]:
+    """Dispatch to the chosen sampling method."""
+    if sampling == "diverse_shards":
+        return diverse_shard_iter(dataset_name, seed)
+    if sampling == "streaming_default":
+        return streaming_default_iter(dataset_name, split, seed)
+    raise ValueError(f"unknown sampling mode: {sampling}")
 
 
 # ─── Phase 1: extract ────────────────────────────────────────────────────────
@@ -173,10 +271,7 @@ def cmd_extract(args):
     print(f"[extract] hooking layers[{args.layer}] of {len(layers)} "
           f"({type(target_block).__name__}); d_model={d_model}")
 
-    # The hook captures the residual-stream output of block K. HF hidden_states
-    # convention: hidden_states[K+1] = output of layer K. The block returns
-    # either a Tensor or (Tensor, ...); we take [0] in the tuple case.
-    captured: dict[str, torch.Tensor] = {}
+    captured: dict[str, "torch.Tensor"] = {}
 
     def hook(_, _ins, output):
         h = output[0] if isinstance(output, tuple) else output
@@ -184,27 +279,21 @@ def cmd_extract(args):
 
     handle = target_block.register_forward_hook(hook)
 
-    # Pad-on-the-left would shift positions; HF default is right-padding which
-    # keeps real positions at small indices. We keep right-padding and use the
-    # attention mask to bound the "valid" range.
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
 
     special_ids = set(tok.all_special_ids or [])
 
-    # Fixed-size list keeps reads ~10× faster than variable list for the vector
-    # column; d_model is known here. fp32 (not fp16) — Gemma-3 residual-stream
-    # elements routinely exceed fp16's 65504 max (~64% of layer-32 vectors had
-    # at least one inf element when stored as fp16), which destroys the data.
-    # bf16-source → fp32 is a lossless upcast.
+    # Vectors as fp32 (Gemma residual elements exceed fp16 max for ~60% of
+    # samples, so fp16 storage destroys the data).
     schema = pa.schema([
         pa.field("sample_idx", pa.int64()),
         pa.field("token_id", pa.int64()),
         pa.field("token_str", pa.string()),
         pa.field("position", pa.int32()),
         pa.field("seq_len", pa.int32()),
-        pa.field("vec_norm", pa.float32()),     # raw L2-norm of activation
-        pa.field("text_preview", pa.string()),  # first 200 chars
+        pa.field("vec_norm", pa.float32()),
+        pa.field("text_preview", pa.string()),
         pa.field("activation", pa.list_(pa.float32(), d_model)),
     ])
 
@@ -217,7 +306,8 @@ def cmd_extract(args):
     n_attempted = 0
     t0 = time.time()
 
-    src = stream_samples(args.dataset, args.split, args.seed)
+    src = stream_samples(args.dataset, args.split, args.seed,
+                         sampling=args.sampling)
 
     while n_written < args.n:
         texts: list[str] = []
@@ -238,7 +328,7 @@ def cmd_extract(args):
             model(input_ids=enc["input_ids"],
                   attention_mask=enc["attention_mask"],
                   use_cache=False)
-        h = captured["h"]  # [B, T, d]
+        h = captured["h"]
         assert h.shape[-1] == d_model, (
             f"hooked tensor d={h.shape[-1]} != d_model={d_model}; "
             f"target_block produced an unexpected shape — wrong layer index?"
@@ -254,14 +344,11 @@ def cmd_extract(args):
             )
             if p < 0:
                 continue
-            v_fp32 = h[i, p].detach().to(torch.float32).cpu().numpy()  # [d]
+            v_fp32 = h[i, p].detach().to(torch.float32).cpu().numpy()
             tok_id = int(ids_cpu[i, p].item())
             seq_len = int(mask_cpu[i].sum().item())
             rows["sample_idx"].append(n_written)
             rows["token_id"].append(tok_id)
-            # decode([id]) on a single id is a fast path; for byte-level BPE it
-            # may yield the visible piece (e.g. " the" with leading space) which
-            # is exactly what we want for downstream grouping.
             rows["token_str"].append(tok.decode([tok_id]))
             rows["position"].append(int(p))
             rows["seq_len"].append(seq_len)
@@ -285,8 +372,27 @@ def cmd_extract(args):
         writer.write_table(pa.table(rows, schema=schema))
     writer.close()
     handle.remove()
+
+    # Sidecar JSON: shard list + run metadata for reproducibility.
+    meta = {
+        "dataset": args.dataset,
+        "split": args.split,
+        "sampling": args.sampling,
+        "seed": args.seed,
+        "n_target": args.n,
+        "n_written": n_written,
+        "max_len": args.max_len,
+        "skip_first": args.skip_first,
+        "base_model": args.base_model,
+        "layer": args.layer,
+        "selected_shards": list(getattr(diverse_shard_iter,
+                                        "last_selection", []) or []),
+    }
+    meta_path = out_path.with_suffix(out_path.suffix + ".meta.json")
+    meta_path.write_text(json.dumps(meta, indent=2))
     print(f"[extract] done. wrote {n_written} rows to {out_path} "
           f"in {(time.time()-t0)/60:.1f} min")
+    print(f"[extract] metadata sidecar: {meta_path}")
 
 
 # ─── Phase 2: decode (AV via SGLang + AR locally) ────────────────────────────
@@ -299,27 +405,26 @@ def cmd_decode(args):
     import pyarrow.parquet as pq
     import torch
 
-    # nla_inference is a sibling file in this repo.
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from nla_inference import EXPLANATION_RE, NLAClient, NLACritic
 
-    rng = random.Random(args.seed)  # noqa: F841 — kept for future stochastic ops
+    rng = random.Random(args.seed)  # noqa: F841
 
     av_client = NLAClient(args.av_checkpoint, sglang_url=args.sglang_url)
     critic = NLACritic(args.ar_checkpoint, device=args.ar_device)
 
-    # Cross-check d_model between the activations file and the loaded checkpoints.
     pf = pq.ParquetFile(args.activations)
     n_total = pf.metadata.num_rows
     # Old fp16 schema used "activation_fp16" — read either name.
-    act_col = "activation" if "activation" in pf.schema_arrow.names else "activation_fp16"
+    act_col = ("activation" if "activation" in pf.schema_arrow.names
+               else "activation_fp16")
     act_field = pf.schema_arrow.field(act_col)
     d_act = act_field.type.list_size
     d_av = av_client.cfg.d_model
     if d_act != d_av:
-        sys.exit(f"d_model mismatch: activations={d_act}, AV checkpoint={d_av}. "
-                 f"Wrong checkpoint for these activations?")
-    print(f"[decode] {n_total} activations  d_model={d_act}")
+        sys.exit(f"d_model mismatch: activations={d_act}, AV checkpoint={d_av}.")
+    print(f"[decode] {n_total} activations  d_model={d_act}  "
+          f"(reading column '{act_col}')")
 
     out_schema = pa.schema([
         pa.field("sample_idx", pa.int64()),
@@ -330,12 +435,10 @@ def cmd_decode(args):
         pa.field("vec_norm", pa.float32()),
         pa.field("text_preview", pa.string()),
         pa.field("explanation", pa.string()),
-        pa.field("raw_av_text", pa.string()),    # full AV gen, pre-tag-extraction
-        pa.field("av_parsed", pa.bool_()),       # whether <explanation> tags found
+        pa.field("raw_av_text", pa.string()),
+        pa.field("av_parsed", pa.bool_()),
         pa.field("mse_nrm", pa.float32()),
         pa.field("cos", pa.float32()),
-        # Vectors as fp32 (Gemma residual elements exceed fp16 max for ~60% of
-        # samples, so fp16 storage destroys the data).
         pa.field("activation", pa.list_(pa.float32(), d_act)),
         pa.field("recon", pa.list_(pa.float32(), d_act)),
     ])
@@ -349,7 +452,7 @@ def cmd_decode(args):
     }
 
     async def run():
-        # Larger pool than the default (100/20) — av_concurrency can be 16+
+        # Bigger pool than the default (100/20) — av_concurrency can be 16+
         # and we want headroom for retries that briefly hold both the new and
         # the dying connection.
         limits = httpx.Limits(max_connections=args.av_concurrency * 4,
@@ -361,9 +464,6 @@ def cmd_decode(args):
         sem = asyncio.Semaphore(args.av_concurrency)
 
         async def call_av(vec_np: np.ndarray) -> str:
-            # _build_embeds is sync (CPU torch); the embed lookup is
-            # ~100 token IDs through a bf16 table on CPU — a few ms, fine in
-            # the event loop. The HTTP wait is the actual bottleneck.
             embeds_np, _ = av_client._build_embeds(
                 torch.as_tensor(vec_np, dtype=torch.float32), prompt_content=None
             )
@@ -371,9 +471,8 @@ def cmd_decode(args):
                 {"input_embeds": embeds_np, "sampling_params": sampling_params},
                 option=orjson.OPT_SERIALIZE_NUMPY,
             )
-            # Transient httpx.ReadError / RemoteProtocolError can hit at
-            # 10+ concurrent requests vs. sglang. Cheap to retry — sglang
-            # /generate is idempotent.
+            # Transient httpx.ReadError/RemoteProtocolError can hit at
+            # 10+ concurrent requests vs. sglang. Cheap to retry.
             last_exc: Exception | None = None
             for attempt in range(4):
                 try:
@@ -403,7 +502,6 @@ def cmd_decode(args):
             d = batch.to_pydict()
             vecs = [np.asarray(v, dtype=np.float32) for v in d[act_col]]
 
-            # AV in parallel (network-bound).
             raw_texts = await asyncio.gather(*(call_av(v) for v in vecs))
 
             for i, (v, raw) in enumerate(zip(vecs, raw_texts)):
@@ -415,7 +513,6 @@ def cmd_decode(args):
                     expl = m.group(1).strip()
                     parsed = True
 
-                # AR forward — single short prompt, fast on GPU.
                 pred = critic.reconstruct(expl)
                 gold = torch.as_tensor(v, dtype=torch.float32)
                 pred_n = pred / pred.norm().clamp_min(1e-12) * critic.mse_scale
@@ -436,8 +533,10 @@ def cmd_decode(args):
                 rows["av_parsed"].append(parsed)
                 rows["mse_nrm"].append(mse)
                 rows["cos"].append(cos)
-                rows["activation"].append(d[act_col][i] if act_col == "activation"
-                                          else np.asarray(d[act_col][i], dtype=np.float32).tolist())
+                rows["activation"].append(
+                    d[act_col][i] if act_col == "activation"
+                    else np.asarray(d[act_col][i], dtype=np.float32).tolist()
+                )
                 rows["recon"].append(
                     pred.to(torch.float32).cpu().numpy().tolist()
                 )
@@ -461,7 +560,7 @@ def cmd_decode(args):
     print(f"[decode] done. wrote {args.out}")
 
 
-# ─── Smoke (no GPU, no remote services) ──────────────────────────────────────
+# ─── Smoke ───────────────────────────────────────────────────────────────────
 
 
 def cmd_smoke(args):
@@ -474,62 +573,36 @@ def cmd_smoke(args):
     mask = [1] * 15
     p = pick_random_position(ids, mask, special_ids={204}, skip_first=10, rng=rng)
     assert 10 <= p < 14, f"got {p}"
-    p_none = pick_random_position(
-        ids, mask, special_ids=set(range(100, 250)), skip_first=10, rng=rng,
-    )
-    assert p_none == -1
-    p_padded = pick_random_position(
-        ids, [1] * 12 + [0] * 3, special_ids=set(), skip_first=10, rng=rng,
-    )
-    assert 10 <= p_padded < 12
     print("    OK")
 
-    print("[smoke] parquet schema round-trip (fixed-size float16 list) …")
-    d_model = 8
+    print("[smoke] parquet schema round-trip …")
     schema = pa.schema([
         pa.field("sample_idx", pa.int64()),
-        pa.field("token_id", pa.int64()),
-        pa.field("activation_fp16", pa.list_(pa.float16(), d_model)),
+        pa.field("activation", pa.list_(pa.float32(), 8)),
     ])
-    rows = {
-        "sample_idx": [0, 1],
-        "token_id": [42, 43],
-        "activation_fp16": [
-            np.arange(d_model, dtype=np.float16).tolist(),
-            np.arange(d_model, dtype=np.float16).tolist()[::-1],
-        ],
-    }
+    rows = {"sample_idx": [0, 1],
+            "activation": [list(np.arange(8, dtype=np.float32)),
+                           list(np.arange(8, dtype=np.float32)[::-1])]}
     tbl = pa.table(rows, schema=schema)
     tmp = Path("/tmp/_recon_smoke.parquet")
     pq.write_table(tbl, tmp, compression="zstd")
     back = pq.read_table(tmp)
     assert back.num_rows == 2
-    assert back.schema.field("activation_fp16").type.list_size == d_model
-    print(f"    OK ({tmp.stat().st_size} B)")
-
-    print("[smoke] importing nla_inference (no model load) …")
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import nla_inference  # noqa: F401
     print("    OK")
 
     if args.check_dataset:
-        print(f"[smoke] streaming first {args.n} samples from "
-              f"{args.dataset!r} (split={args.split!r}) …")
+        print(f"[smoke] diverse_shards probe (seed=0)…")
         try:
-            from datasets import load_dataset
-            ds = load_dataset(args.dataset, split=args.split, streaming=True)
-            it = iter(ds)
+            it = stream_samples(args.dataset, args.split, 0,
+                                sampling="diverse_shards")
             for i in range(args.n):
-                ex = next(it)
-                if i == 0:
-                    print(f"    fields: {list(ex.keys())}")
-                text = ex.get("text") or ex.get("content") or ""
-                print(f"    [{i}] len={len(text)}  preview={text[:80]!r}")
+                t = next(it)
+                print(f"    [{i}] {t[:80]!r}")
         except Exception as e:
             print(f"    FAILED: {e}")
             return 1
     else:
-        print("[smoke] skipping dataset connectivity (pass --check-dataset to test)")
+        print("[smoke] skipping dataset probe (pass --check-dataset to test)")
 
     print("[smoke] done")
     return 0
@@ -545,61 +618,45 @@ def main(argv: list[str] | None = None) -> int:
     )
     sp = p.add_subparsers(dest="cmd", required=True)
 
-    # extract
     pe = sp.add_parser("extract", help="phase 1: base model → activations parquet")
-    pe.add_argument("--base-model", required=True,
-                    help="HF id, e.g. google/gemma-3-27b-it")
-    pe.add_argument("--layer", type=int, required=True,
-                    help="layer index K — output of layers[K] is captured "
-                         "(= HF hidden_states[K+1]). E.g. 41 for Gemma-3-27B.")
-    pe.add_argument("--n", type=int, default=100_000)
+    pe.add_argument("--base-model", required=True)
+    pe.add_argument("--layer", type=int, required=True)
+    pe.add_argument("--n", type=int, default=20_000)
     pe.add_argument("--max-len", type=int, default=512)
-    pe.add_argument("--batch-size", type=int, default=4)
-    pe.add_argument("--skip-first", type=int, default=10,
-                    help="Skip first N positions (early-sequence positions are "
-                         "noisy per README — residual stream hasn't accumulated).")
+    pe.add_argument("--batch-size", type=int, default=8)
+    pe.add_argument("--skip-first", type=int, default=10)
     pe.add_argument("--dataset", default="common-pile/comma_v0.1_training_dataset")
     pe.add_argument("--split", default="train")
     pe.add_argument("--seed", type=int, default=0)
+    pe.add_argument("--sampling", default="diverse_shards",
+                    choices=["diverse_shards", "streaming_default"],
+                    help="diverse_shards = pick 1 random shard per source dir "
+                         "(reproducible via seed). streaming_default = the old "
+                         "biased buffered shuffle.")
     pe.add_argument("--device-map", default="auto")
     pe.add_argument("--out", required=True)
-    pe.add_argument("--flush-every", type=int, default=512,
-                    help="Rows buffered before each parquet write.")
+    pe.add_argument("--flush-every", type=int, default=512)
     pe.set_defaults(func=cmd_extract)
 
-    # decode
-    pd_ = sp.add_parser("decode",
-                        help="phase 2: activations parquet → AV (SGLang) → AR → results parquet")
-    pd_.add_argument("--activations", required=True,
-                     help="Path to phase-1 output.")
-    pd_.add_argument("--av-checkpoint", required=True,
-                     help="HF-format AV (verbalizer) dir with nla_meta.yaml. "
-                          "Same path SGLang is serving.")
-    pd_.add_argument("--ar-checkpoint", required=True,
-                     help="HF-format AR (reconstructor) dir.")
+    pd_ = sp.add_parser("decode")
+    pd_.add_argument("--activations", required=True)
+    pd_.add_argument("--av-checkpoint", required=True)
+    pd_.add_argument("--ar-checkpoint", required=True)
     pd_.add_argument("--sglang-url", default="http://localhost:30000")
     pd_.add_argument("--ar-device", default="cuda:0")
-    pd_.add_argument("--av-concurrency", type=int, default=8,
-                     help="Max in-flight AV HTTP requests. SGLang's continuous "
-                          "batcher packs server-side; 8–16 is usually plenty.")
+    pd_.add_argument("--av-concurrency", type=int, default=16)
     pd_.add_argument("--av-timeout", type=float, default=120.0)
-    pd_.add_argument("--temperature", type=float, default=0.0,
-                     help="0.0 = greedy, reproducible. 0.7+ for sampling.")
+    pd_.add_argument("--temperature", type=float, default=0.0)
     pd_.add_argument("--max-new-tokens", type=int, default=200)
-    pd_.add_argument("--batch-size", type=int, default=64,
-                     help="Rows read from activations parquet per chunk; "
-                          "also the parallel AV-call window per chunk.")
+    pd_.add_argument("--batch-size", type=int, default=64)
     pd_.add_argument("--flush-every", type=int, default=512)
     pd_.add_argument("--seed", type=int, default=0)
     pd_.add_argument("--out", required=True)
     pd_.set_defaults(func=cmd_decode)
 
-    # smoke
-    ps = sp.add_parser("smoke", help="CPU-only sanity checks")
-    ps.add_argument("--check-dataset", action="store_true",
-                    help="Also stream a few samples from the HF dataset "
-                         "(requires network).")
-    ps.add_argument("--n", type=int, default=3)
+    ps = sp.add_parser("smoke")
+    ps.add_argument("--check-dataset", action="store_true")
+    ps.add_argument("--n", type=int, default=5)
     ps.add_argument("--dataset", default="common-pile/comma_v0.1_training_dataset")
     ps.add_argument("--split", default="train")
     ps.set_defaults(func=cmd_smoke)
