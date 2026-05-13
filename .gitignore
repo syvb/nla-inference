@@ -3,3 +3,6 @@ __pycache__/
 experiments/*/data/
 experiments/*/*.parquet
 experiments/*/*.tar.zst
+nla-analysis/*.csv
+nla-analysis/*.jsonl
+nla-analysis/*.log
