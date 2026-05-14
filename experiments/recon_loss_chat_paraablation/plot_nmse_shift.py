@@ -1,10 +1,8 @@
 """Plot the NMSE distribution shift on assistant-content tokens only.
 
-Two panels:
-  (a) overlaid histograms of NMSE_original vs NMSE_modified (asst_content)
-  (b) histogram of per-sample Δ NMSE = NMSE_modified − NMSE_original
-
-Saved as a PNG.
+Emits two separate PNGs:
+  --out-dist:  overlaid histograms of NMSE_original vs NMSE_modified
+  --out-delta: histogram of per-sample Δ NMSE = NMSE_modified − NMSE_original
 """
 from __future__ import annotations
 
@@ -21,7 +19,8 @@ import matplotlib.pyplot as plt
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--comparison-parquet", required=True)
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out-dist", required=True)
+    ap.add_argument("--out-delta", required=True)
     args = ap.parse_args()
 
     print(f"[plot] loading {args.comparison_parquet}")
@@ -39,12 +38,8 @@ def main():
     print(f"  NMSE modif mean={nmse_m.mean():.4f}  median={np.median(nmse_m):.4f}")
     print(f"  delta      mean={delta.mean():+.4f}  median={np.median(delta):+.4f}")
 
-    # ── Plot
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
-
-    # (a) overlaid histograms
-    ax = axes[0]
-    # Clip extreme tail at p99.5 of either dist for a readable x-axis
+    # ── Plot 1: overlaid NMSE distributions
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
     hi = float(np.percentile(np.concatenate([nmse_o, nmse_m]), 99.5))
     bins = np.linspace(0, hi, 80)
     ax.hist(nmse_o, bins=bins, alpha=0.55, label="original (3-paragraph AV)",
@@ -61,9 +56,14 @@ def main():
     ax.set_title(f"NMSE distribution shift  ·  asst_content tokens  ·  n = {n:,}")
     ax.legend(loc="upper right", fontsize=9)
     ax.grid(alpha=0.25, linewidth=0.5)
+    fig.tight_layout()
+    Path(args.out_dist).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(args.out_dist, dpi=140)
+    plt.close(fig)
+    print(f"[plot] wrote {args.out_dist}")
 
-    # (b) delta NMSE histogram
-    ax = axes[1]
+    # ── Plot 2: per-sample Δ NMSE
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
     dhi = float(np.percentile(delta, 99))
     dlo = float(np.percentile(delta, 1))
     dbins = np.linspace(dlo, dhi, 80)
@@ -76,14 +76,15 @@ def main():
     worse_frac = (delta > 0).mean()
     ax.set_xlabel("Δ NMSE  (modified − original)")
     ax.set_ylabel("count")
-    ax.set_title(f"per-sample Δ NMSE  ·  {100*worse_frac:.1f}% worsen")
+    ax.set_title(f"per-sample Δ NMSE  ·  asst_content  ·  "
+                 f"{100*worse_frac:.1f}% worsen")
     ax.legend(loc="upper right", fontsize=9)
     ax.grid(alpha=0.25, linewidth=0.5)
-
     fig.tight_layout()
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(args.out, dpi=140)
-    print(f"[plot] wrote {args.out}")
+    Path(args.out_delta).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(args.out_delta, dpi=140)
+    plt.close(fig)
+    print(f"[plot] wrote {args.out_delta}")
 
 
 if __name__ == "__main__":
