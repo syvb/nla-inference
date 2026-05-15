@@ -1,8 +1,8 @@
 """Plot the NMSE distribution shift on assistant-content tokens only.
 
 Emits two separate PNGs:
-  --out-dist:  overlaid histograms of NMSE_original vs NMSE_modified
-  --out-delta: histogram of per-sample Δ NMSE = NMSE_modified − NMSE_original
+  --out-dist:  overlaid histograms of NMSE_original vs NMSE_<variant>
+  --out-delta: histogram of per-sample Δ NMSE = NMSE_<variant> − NMSE_original
 """
 from __future__ import annotations
 
@@ -19,19 +19,25 @@ import matplotlib.pyplot as plt
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--comparison-parquet", required=True)
+    ap.add_argument("--variant-col", default="nmse_modified",
+                    help="name of the variant's NMSE column to compare "
+                         "against nmse_original")
+    ap.add_argument("--variant-label", default="modified (2 constants + final ¶)",
+                    help="legend/title label for the variant")
     ap.add_argument("--out-dist", required=True)
     ap.add_argument("--out-delta", required=True)
     args = ap.parse_args()
 
     print(f"[plot] loading {args.comparison_parquet}")
     df = pq.read_table(args.comparison_parquet,
-                        columns=["role", "nmse_original", "nmse_modified"]).to_pandas()
+                        columns=["role", "nmse_original",
+                                 args.variant_col]).to_pandas()
     df = df[df.role == "asst_content"].reset_index(drop=True)
     n = len(df)
-    print(f"[plot] n = {n} asst_content rows")
+    print(f"[plot] n = {n} asst_content rows  variant={args.variant_col}")
 
     nmse_o = df.nmse_original.values
-    nmse_m = df.nmse_modified.values
+    nmse_m = df[args.variant_col].values
     delta = nmse_m - nmse_o
 
     print(f"  NMSE orig  mean={nmse_o.mean():.4f}  median={np.median(nmse_o):.4f}")
@@ -44,14 +50,14 @@ def main():
     bins = np.linspace(0, hi, 80)
     ax.hist(nmse_o, bins=bins, alpha=0.55, label="original (3-paragraph AV)",
             color="#1f77b4", edgecolor="none")
-    ax.hist(nmse_m, bins=bins, alpha=0.55, label="modified (2 constants + final ¶)",
+    ax.hist(nmse_m, bins=bins, alpha=0.55, label=args.variant_label,
             color="#d62728", edgecolor="none")
     ax.axvline(nmse_o.mean(), color="#1f77b4", linestyle=":", linewidth=1.5,
                 label=f"orig mean = {nmse_o.mean():.4f}")
     ax.axvline(nmse_m.mean(), color="#d62728", linestyle=":", linewidth=1.5,
                 label=f"modif mean = {nmse_m.mean():.4f}")
     ax.set_xlim(0, hi)
-    ax.set_xlabel("NMSE  (= 2·(1−cos),  0 = perfect)")
+    ax.set_xlabel("NMSE  (0 = perfect)")
     ax.set_ylabel("count")
     ax.set_title(f"NMSE distribution shift  ·  asst_content tokens  ·  n = {n:,}")
     ax.legend(loc="upper right", fontsize=9)

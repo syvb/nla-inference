@@ -42,6 +42,28 @@ case "$cmd" in
             2>&1 | tee ar_run.log
         ;;
 
+    run-many)
+        # Run AR over a list of (input → output) pairs. Pass pairs as
+        # extra args: in1 out1 in2 out2 ...  Stream all output into one
+        # combined log + per-pair logs.
+        shift
+        if (( $# % 2 != 0 )); then
+            echo "run-many requires even number of args: in1 out1 in2 out2 ..." >&2
+            exit 2
+        fi
+        : > ar_run_many.log
+        while (( $# >= 2 )); do
+            inp=$1; outp=$2; shift 2
+            echo "[pod] AR: $inp -> $outp" | tee -a ar_run_many.log
+            python run_ar.py \
+                --ar-checkpoint nla-ar \
+                --input "$inp" \
+                --out "$outp" \
+                --ar-device cuda:0 \
+                2>&1 | tee -a ar_run_many.log
+        done
+        ;;
+
     all)
         "$0" install
         "$0" download

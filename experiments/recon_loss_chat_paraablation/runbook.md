@@ -82,6 +82,40 @@ explanation provides. Only `role_marker` tokens (n=244) actually
 improve under the ablation; all four other roles get uniformly worse
 by Δ NMSE ≈ +0.005…+0.007.
 
+## Run 2 — inverse ablation (2026-05-14, ~23:35 UTC)
+
+Same source dataset, but ablating P3 instead of P1+P2:
+
+- `removed_final`: explanation = P1+P2 (drop P3 entirely)
+- `const_final`:   explanation = P1+P2 + canned "Final token 'wide'…"
+
+Both run in one pod via the new `pod_runner.sh run-many` command.
+
+- 23:30 UTC — pod creation (`sh9ftnr17hh7of`, AP-IN-1, $2.99/hr)
+- 23:33 UTC — IP/port assigned (~3 min wait)
+- 23:35 UTC — files scp'd
+- 23:35–23:38 UTC — install + AR download (cached image, fast)
+- 23:38–23:46 UTC — AR variant 1 (removed_final): 19,880 rows / 8.95 min / 37.0/s
+- 23:46–23:55 UTC — AR variant 2 (const_final):   19,880 rows / 8.88 min / 37.3/s
+- 23:57 UTC — outputs scp'd back
+- 23:58 UTC — pod DELETE → 204 / 404
+
+**Pod cost: ~28 min × $2.99/hr ≈ $1.40.**
+
+### Inverse-result headlines (asst_content)
+
+| variant            | mean NMSE | Δ vs orig | %worse |
+|--------------------|----------:|----------:|-------:|
+| original           | 0.0087    | +0.0000   |   0.0% |
+| final-¶ only       | 0.0157    | +0.0070   |  98.6% |
+| removed_final      | 0.0196    | +0.0108   |  98.9% |
+| const_final        | **0.0424**| **+0.0337** | **100.0%** |
+
+See `findings_inv.md` for details. The headline finding: a *misleading*
+canned final paragraph is ~2× worse than no final paragraph, and ~5×
+worse than the original — the AR commits to the wrong target token and
+produces an actively-wrong reconstruction.
+
 ## Tooling notes for next time
 
 - The RunPod pytorch image has two Python interpreters: `python`
