@@ -20,7 +20,8 @@ import matplotlib.pyplot as plt
 VARIANTS = [
     # (col, label, color)
     ("nmse_original",      "original (3-paragraph AV)",                  "#1f77b4"),
-    ("nmse_final_only",    "final-¶ only (P1,P2 replaced)",              "#d62728"),
+    ("nmse_final_only",    "final-¶ only (P1,P2 replaced by constants)", "#d62728"),
+    ("nmse_only_final",    "only P3 (no prelude)",                       "#9467bd"),
     ("nmse_removed_final", "first two only (P3 removed)",                "#2ca02c"),
     ("nmse_const_final",   "first two + canned P3 ('wide' sentence)",    "#ff7f0e"),
 ]
