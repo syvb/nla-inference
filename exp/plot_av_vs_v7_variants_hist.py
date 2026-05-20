@@ -61,8 +61,6 @@ def main():
     series = [
         (av,  "AV (trained)",                       "#1f77b4"),
         (v7d, "v7delim (input + delim + analysis)", "#2ca02c"),
-        (v7,  "v7 (explanation only)",              "#d62728"),
-        (v7p, "v7+input (appended, no delim)",      "#ff7f0e"),
     ]
     for arr, label, color in series:
         ax.hist(arr, bins=bins, alpha=0.5, color=color,
