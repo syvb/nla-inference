@@ -1,0 +1,123 @@
+You will be shown a text snippet, and asked to predict the most important features a language model would use to predict what text comes next.
+
+A language model needs to predict what text comes next after a snippet which will be presented to you shortly. Write 3 paragraphs about the text.
+
+Focus on what the language model must be "thinking about" at the point where the provided text ends. You should not need to reference the fact that the text is truncated/incomplete/a prefix: the language model is causal, so only sees the prefix to what it predicts and this is implicit.
+
+The final feature must describe the very end of the presented sequence: its role, what it's part of, and immediate constraints on what follows.
+
+Format — IMPORTANT: keep to ~80-100 words total and ALWAYS close the tag:
+<analysis>
+[first feature — include specific examples when relevant]
+[second feature]
+[final feature: the last token, its role, immediate constraints]
+</analysis>
+
+Below are 5 example input/output pairs. Your response should match the style, length, structure, and tone of the example outputs as closely as possible. It should be impossible to distinguish your response from the examples. You should quote the original text very frequently, including verbatim quotes as much as possible. Every paragraph (except perhaps the first) MUST have quotes, ideally multiple.
+
+--- Example 1 ---
+Input:
+<begin_text>RESPIRATION. 119 
+which the air is introduced into the body. It will now be necessary  to describe the changes that take place there. The atmospheric  air, when it goes into the lungs, is composed of about four parts  of a gas called nitrogen, and one part of another gas called  oxygen, (a small quantity of carbonic acid in the air). But  <end_text>
+
+Output:
+<analysis>
+Educational manual form of English physiology, with didactic exposition of air and respiration—a formal textbook passage explaining the breathing process.
+
+The sentence "Since air is necessary to the living body, and the blood is not a gas—" signals a contrast or illustration is coming, establishing the fundamental difference between animal respiration and the air.
+
+Final token "  " ends a declarative clause ("Since the blood is not a gas, but..."), requiring a predicate — likely "the oxygen of the blood is..." or "oxygen is consumed in the lungs" or "in the human body, the blood differs..." or "the process of respiration is..." introducing the vital property of oxygen or the new discovery.
+</analysis>
+
+--- Example 2 ---
+Input:
+<begin_text>Include javascript variable inside php tags
+i have javascript as below 
+ html="<th>"+<?php echo __(); ?>+"</th>";
+
+I want to add another javascript variable inside to __() function like this
+<?php echo __(<js varible>); ?>
+
+I tried  
+var myvarible=200;
+html="<th>"+<?php echo __("'"+myvarible+"'"); ?>+"</th>";
+console.log(html);
+
+not working for me
+can any one help me please
+<end_text>
+
+Output:
+<analysis>
+Forum Q&A structure: answer format with troubleshooting advice, suggesting a code/solution response is expected for the php/html problem.
+
+The phrase "please try to use the following code" signals a troubleshooting answer, likely addressing the issue of the incorrect output or the workaround for the redirect.
+
+Final token "
+" ends a question/answer prompt ("please try to fix your code
+"), immediately expecting a new answer section or suggestion like "You can use..." or "the problem is..." or "First, you should..." or "Yes, the answer is..." or "the reason is..." or "show the full code snippet" to provide a solution or clarification.
+</analysis>
+
+--- Example 3 ---
+Input:
+<begin_text>can you help me find a guesthouse with free parking?
+definitely! do you have a price range and/or area in mind?
+i would like the guesthouse to be in the cheap range.
+we have a couple of choices for 4 star ones in the center and the east. shall i just pick one for you?
+yes, i need to book it for 5 people.
+the alexander bed and breakfast is a 4 star facility with internet and free parking. their number is 01223525725. what day would you like to arrive?
+great can you book it for 5 people for 3 nights starting monday?
+booking was successful. reference number is : anh718q1 . is there anything else i can help with<end_text>
+
+Output:
+<analysis>
+Structured Q&A format signals a chatbot response, establishing a helpful, conversational tone for a car rental recommendation.
+
+The phrase "Definitely" opens a polite confirmation response ("Certainly, I can help you find recommendations"), priming a direct answer about the search.
+
+Final token "definitely" opens a polite closing phrase ("Certainly...I can help you. Definitely"), immediately expecting a response like "! I can help" or "can tell you..." or "! Yes, I can." or "I can! Tell me more about your preferences." or "but I need more information" — a chatbot answer prompt.
+</analysis>
+
+--- Example 4 ---
+Input:
+<begin_text>[03:04] <richbayliss> soundray: so i could revert back to the kernel which came from DVD
+[03:04] <delmar> mlalkaka, ok i would rather not compile a new kernel if i can avoid it.. .but... i dont know what else to do .. things wont compile because thee is a mismatch... ie. vmware.
+[03:04] <HammerBlade2020> nickrud, :-)
+[03:05] <HammerBlade2020> nickrud~ does this make your text red?
+[03:05] <IdleOne> HammerBlade2020:  yes
+[03:05] <nickrud> HammerBlade2020: but of course
+[03:05] <mlalkaka> delmar, where are the kernel headers from?
+[03:05] <HammerBlade2020> i just wanted to switch to ~
+[03:05] <delmar> mlalkaka, kernel package is <IP_ADDRESS>.1 and headers is 2.6.12-9.23...
+[03:05] <HammerBlade2020> :-) thanks
+[03:05] <soundray> richbayliss, if I was in your place, I'd probably try 2.6.15, but it's not generally recommended.
+[03:05] <LinuxJones> HammerBlade2020: why not add a few more digits to make your name even longer :)
+[03:05] <delmar> mlalkaka, from apt sources I guess. I didn't add them.
+[03:05] <HammerBlade2020> LinuxJones~ hmm, i've always used this nick :-P
+[<end_text>
+
+Output:
+<analysis>
+Structured wiki/chat log format with repeated pattern: message metadata, chat transcript, and post-mortem summary for a Japanese IRC user.
+
+The sequence "User [1] : Hello" and "User [1] : Hello" suggests a repeating pattern of player name/nickname entries, continuing the final post.
+
+Final token " ['" ends a bracketed comment block ("User_name_1 : Hello"), immediately expecting a closing bracket or continuation like "12:39]" or "12:40]" or "Loki's reply" or "0: The chat log" — likely referencing the name or a comment about the solution.
+</analysis>
+
+--- Example 5 ---
+Input:
+<begin_text>We can resume our hearing. We have two more agenda items this afternoon. We have cost share reduction policy update and we have a potential vote noticed. And then after that we'll have the monthly ahead model and global payment development update. And I'm not sure how long we'll go today, but we're scheduled to go till five. And so I'll turn it to Mike Barber on the cost share reduction policy update. I'm not sure board members have any questions or comments, but Mike, did you have anything to add at this point? I did want to add that we didn't receive any additional public comment, besides the comment that Mr. Fisher gave at the meeting last week. And I previously shared with you all the feedback we got from the carriers, which is kind of what prompted us to present two options for your consideration. So, and then Mr. Fisher had a question that he posed last week. And I think Kevin, if he's on the line is able to answer that. Are you on Kevin? I am, yes. There are some question marks and things where we'd be able to hopefully tighten things up a little more, but we believe that the initial proposed guidance would probably increase the APTC by about 15 to 25 million. And that the revised proposed guidance would increase APTC by about 35 to 45 million. Both of those relative to the status quo. So some error bars around it, but 20 for one option and 40 for the other. And that's all the new information I think we had to give you. We'd be happy to pull up the slides from last week and try to answer any questions you might have. Yeah, would you pull up that slide 11 to kind of orient the board members and then we can have any discussion or questions that there may have. Yes, just giving one second. Showing for you all. Yes, I'll open up to the board members for questions or comments or thoughts they may have<end_text>
+
+Output:
+<analysis>
+Meeting agenda structure: podcast/meeting recap format is progressing through a live discussion walkthrough, with the team wrapping up the review.
+
+The sentence "Please feel free to share any thoughts or questions they may have" signals a closing solicitation for feedback or discussion, establishing a polite, open invitation to the group.
+
+Final token "have" ends a closing clause ("any thoughts or questions they may have"), immediately expecting a noun phrase like "on the draft" or "regarding this topic." or "on the bill." or "first." or "about the draft at this point." — likely "on the bill or any thoughts they have" before opening the floor.
+</analysis>
+
+---
+
+Now produce an <analysis>...</analysis> response for the user's text below. Match the style of the examples above as closely as possible.
