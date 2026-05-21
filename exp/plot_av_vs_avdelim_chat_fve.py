@@ -56,27 +56,31 @@ def main():
     rows = np.asarray(rows)
     av, avd, base = rows[:, 0], rows[:, 1], rows[:, 2]
 
-    # Per-sample FVE relative to mean-activation baseline
-    fve_av  = (base - av)  / base
-    fve_avd = (base - avd) / base
+    # Per-sample FVE (for visualization).
+    fve_av  = 1 - av  / base
+    fve_avd = 1 - avd / base
+    # Paper formula: aggregate FVE = 1 - mean(loss) / mean(var)  (single scalar)
+    fve_agg_av  = 1 - av.mean()  / base.mean()
+    fve_agg_avd = 1 - avd.mean() / base.mean()
     n = len(av)
     print(f"n_paired={n}")
-    print(f"  AV       FVE mean={fve_av.mean():.4f}  med={np.median(fve_av):.4f}")
-    print(f"  av_delim FVE mean={fve_avd.mean():.4f}  med={np.median(fve_avd):.4f}")
+    print(f"  AV       per-sample FVE mean={fve_av.mean():.4f}  med={np.median(fve_av):.4f}  aggregate={fve_agg_av:.4f}")
+    print(f"  av_delim per-sample FVE mean={fve_avd.mean():.4f}  med={np.median(fve_avd):.4f}  aggregate={fve_agg_avd:.4f}")
 
     fig, ax = plt.subplots(figsize=(10, 5.5))
     # FVE is unbounded above (can be negative if variant > empty); clip x for display.
     lo, hi = -0.2, 1.0
     bins = np.linspace(lo, hi, 80)
     ax.hist(np.clip(fve_av,  lo, hi), bins=bins, alpha=0.55, color="#1f77b4",
-            label=f"AV baseline                mean={fve_av.mean():.4f}  med={np.median(fve_av):.4f}",
+            label=f"AV baseline   aggregate FVE = {fve_agg_av:.4f}  (paper formula)",
             edgecolor="white", linewidth=0.3)
     ax.hist(np.clip(fve_avd, lo, hi), bins=bins, alpha=0.55, color="#2ca02c",
-            label=f"av_delim (AR + AV expl + source)  mean={fve_avd.mean():.4f}  med={np.median(fve_avd):.4f}",
+            label=f"av_delim       aggregate FVE = {fve_agg_avd:.4f}  (paper formula)",
             edgecolor="white", linewidth=0.3)
-    ax.set_xlabel("per-sample FVE  ((mse_mean_act − mse_variant) / mse_mean_act)")
+    ax.set_xlabel("per-sample FVE  = 1 − ‖h_i − ĥ_i‖² / ‖h_i − h̄‖²")
     ax.set_ylabel("number of samples")
-    ax.set_title(f"AV baseline vs av_delim — per-sample FVE distribution, CHAT (n={n})")
+    ax.set_title(f"AV baseline vs av_delim — FVE distribution, CHAT (n={n})\n"
+                 f"FVE=0 ↔ predicting the mean activation; FVE=1 ↔ perfect reconstruction")
     ax.grid(True, which="both", alpha=0.3)
     ax.axvline(0, color="black", linewidth=0.5, alpha=0.5)
     ax.legend(loc="upper left", fontsize=10)
