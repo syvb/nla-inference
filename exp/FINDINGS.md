@@ -184,6 +184,31 @@ negative). The symmetry does **not** hold. Interpretation:
 
 ---
 
+## 5b. Minor — the AV as a plain text explainer
+
+A quick variant of Thread A: instead of asking *Sonnet* to verbalize from
+text, use the **AV itself**, fed the source text in place of the injected
+activation (minimal prompt rewrite: "activation vector" → "text snippet", put
+`decoded_full` in `<concept>`, no injection). The thought was that the AV is
+already tuned to write in exactly the AR's preferred format, so it might beat
+Sonnet at text→explanation. It does not (chat, n=4820):
+
+| | mse_nrm | FVE-over-empty |
+|---|---|---|
+| AV on activation (baseline) | 0.0116 | 0.780 |
+| **AV on text (this variant)** | 0.0374 | **0.290** |
+| *(ref) Sonnet 4.6 on text (chat v2)* | ~0.024 | ~0.554 |
+
+AV-on-text is worse than *both* the AV-on-activation baseline and Sonnet on the
+same text, and beats the activation baseline on just 0.5% of rows. The AV is
+doubly handicapped on raw text: it's out of distribution (never saw text in the
+`<concept>` slot) and it's only a 12B model, well below Sonnet as a general
+explainer. Being tuned to the output format doesn't compensate. A clean
+negative that reinforces §6.1: the AV's value is in *reading the activation*,
+not in knowing the format.
+
+---
+
 ## 6. Headline takeaways
 
 1. **The activation injection is doing real work.** A frontier model (Sonnet
@@ -238,8 +263,11 @@ negative). The symmetry does **not** hold. Interpretation:
   source+analysis augmented inputs for the AR.
 - `warmstart_run_ar_multi.py` / `warmstart_run_ar_long.py` — AR critic eval
   (multi-variant, long-context).
-- `av_with_source_generate.py` — AV generation with source text in the prompt.
-- `plot_av_vs_avdelim_*.py` — mse and FVE histograms.
+- `av_with_source_generate.py` — AV generation with source text in the prompt
+  (§5).
+- `av_on_text_generate.py` — AV run as a plain text explainer, no injection
+  (§5b).
+- `plot_av_vs_avdelim_*.py`, `plot_av_on_text_hist.py` — mse and FVE histograms.
 - `figures/` — generated charts. `prompt.txt` — the hand-written v7 system
   prompt.
 - Results parquets live under `exp/results/warmstart/` (gitignored — large).
