@@ -207,6 +207,15 @@ explainer. Being tuned to the output format doesn't compensate. A clean
 negative that reinforces §6.1: the AV's value is in *reading the activation*,
 not in knowing the format.
 
+We also tried giving the AV the **v4 few-shot scaffold** (the 4-shot
+multi-turn `<begin_text>`/`<analysis>` prompt that helped Sonnet) instead of
+its native zero-shot prompt, in case better prompting unlocks it. It barely
+moves: FVE-over-empty **0.305** vs 0.284 native (chat, n=4131 shared), better
+on 54% of rows. So the AV retains *some* few-shot ability after RL, but the
+scaffold adds only ~2 pp — still ~half of Sonnet's v4 score (~0.58) and far
+below the activation baseline (0.78). The bottleneck is the AV being OOD on
+text + a weak base, not the prompt.
+
 ---
 
 ## 6. Headline takeaways
@@ -265,8 +274,9 @@ not in knowing the format.
   (multi-variant, long-context).
 - `av_with_source_generate.py` — AV generation with source text in the prompt
   (§5).
-- `av_on_text_generate.py` — AV run as a plain text explainer, no injection
-  (§5b).
+- `av_on_text_generate.py` — AV run as a plain text explainer, native prompt,
+  no injection (§5b).
+- `av_v4format_generate.py` — same but with the v4 few-shot scaffold (§5b).
 - `plot_av_vs_avdelim_*.py`, `plot_av_on_text_hist.py` — mse and FVE histograms.
 - `figures/` — generated charts. `prompt.txt` — the hand-written v7 system
   prompt.
