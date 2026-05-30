@@ -224,6 +224,33 @@ above the mean baseline, let alone to Sonnet's level (~0.23) or the activation
 baseline (0.64). The bottleneck is the AV being OOD on text + a weak base, not
 the prompt.
 
+## 5c. Minor — repeating the injected activation token
+
+Another quick probe of the AV side: instead of the canonical single injection
+site `<concept>㈜</concept>`, render `<concept>㈜㈜…㈜</concept>` with **K copies
+of the marker** and overwrite *all K* token embeddings with the same
+(normalized, scaled) activation — still one `<concept>` tag pair. The thought:
+giving the AV the same vector at several positions might make the signal more
+salient / easier to attend to. K=1 reproduces the canonical AV exactly and is
+the internal control. All on the same 2,000 chat rows, AV sampled at temp=1.0
+and AR-rescored identically:
+
+| K (repeated markers) | mse_nrm | FVE (vs mean act) | Δ FVE vs K=1 |
+|---|---|---|---|
+| **1** (canonical) | 0.01102 | **+0.663** | — |
+| 2 | 0.01134 | +0.653 | −0.010 |
+| 4 | 0.01185 | +0.638 | −0.025 |
+
+It **monotonically hurts** — each extra copy makes reconstruction slightly
+worse (~1 pp FVE at K=2, ~2.5 pp at K=4). Extra salience doesn't help; the AV
+was trained on exactly one marker, and the OOD positional structure of a run of
+identical activation embeddings degrades it instead. K=1 is optimal, so the
+curve would only fall further at higher K (not run). Net: leave the AV with the
+single-marker format it was trained on. (K=1 here scored +0.663 vs the §5b
+stored canonical 0.635 on identical rows — a ~3 pp offset from temp-1.0
+re-sampling + the eager-attention AR pass; the *within-run* K-sweep is the valid
+comparison and is unaffected by that offset.)
+
 ---
 
 ## 6. Headline takeaways
@@ -285,6 +312,8 @@ the prompt.
 - `av_on_text_generate.py` — AV run as a plain text explainer, native prompt,
   no injection (§5b).
 - `av_v4format_generate.py` — same but with the v4 few-shot scaffold (§5b).
+- `av_repeat_generate.py` / `score_repeat_ar.py` — inject the activation into K
+  repeated `<concept>` markers and AR-score (§5c).
 - `plot_av_vs_avdelim_*.py`, `plot_av_on_text_hist.py` — mse and FVE histograms.
 - `figures/` — generated charts. `prompt.txt` — the hand-written v7 system
   prompt.

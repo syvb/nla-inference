@@ -28,6 +28,7 @@ def load_critic(ckpt: Path, device: str, dtype=torch.bfloat16):
     tok = AutoTokenizer.from_pretrained(str(ckpt), trust_remote_code=True)
     backbone = AutoModelForCausalLM.from_pretrained(
         str(ckpt), torch_dtype=dtype, trust_remote_code=True,
+        attn_implementation="eager",
         device_map="auto" if device == "auto" else None,
     )
     backbone.lm_head = torch.nn.Identity()
