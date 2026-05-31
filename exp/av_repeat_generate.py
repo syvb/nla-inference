@@ -32,23 +32,32 @@ def normalize_activation(v: torch.Tensor, target_scale: float) -> torch.Tensor:
     return v / (norm / target_scale).to(v.dtype)
 
 
-def find_marker_run(ids, inj_id, left_id, right_id, k):
-    """Return the list of positions of the contiguous run of `inj_id` markers,
-    bounded by left_id (before) and right_id (after). Asserts the run length
-    matches the expected k. Returns None on mismatch."""
+def find_marker_run(ids, inj_id, left_id, right_id, k, mode="markers"):
+    """Return the K marker positions to inject, or None on mismatch.
+
+    mode="markers": K copies of the marker inside ONE <concept> tag pair, i.e. a
+      contiguous run `<concept>㈜㈜…㈜</concept>` — only the run as a whole is
+      bounded by left_id (before) / right_id (after).
+    mode="tags": K separate `<concept>㈜</concept>` blocks — each marker is
+      individually bounded by left_id / right_id.
+    """
     positions = [p for p in range(len(ids)) if ids[p] == inj_id]
-    if not positions:
-        return None
-    # contiguous?
-    if positions != list(range(positions[0], positions[0] + len(positions))):
-        return None
     if len(positions) != k:
         return None
-    p0, p1 = positions[0], positions[-1]
-    if p0 - 1 < 0 or p1 + 1 >= len(ids):
-        return None
-    if ids[p0 - 1] != left_id or ids[p1 + 1] != right_id:
-        return None
+    if mode == "markers":
+        if positions != list(range(positions[0], positions[0] + k)):
+            return None
+        p0, p1 = positions[0], positions[-1]
+        if p0 - 1 < 0 or p1 + 1 >= len(ids):
+            return None
+        if ids[p0 - 1] != left_id or ids[p1 + 1] != right_id:
+            return None
+    else:  # tags: each marker bounded by its own <concept>…</concept>
+        for p in positions:
+            if p - 1 < 0 or p + 1 >= len(ids):
+                return None
+            if ids[p - 1] != left_id or ids[p + 1] != right_id:
+                return None
     return positions
 
 
@@ -80,7 +89,12 @@ def main():
     ap.add_argument("--av-ckpt", required=True)
     ap.add_argument("--subset", required=True, help="repeat_subset_2k.parquet: sample_idx, decoded_full, activation")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--n-repeat", type=int, required=True, help="K: number of repeated marker tokens")
+    ap.add_argument("--n-repeat", type=int, required=True, help="K: number of repeated markers")
+    ap.add_argument("--repeat-mode", choices=["markers", "tags"], default="markers",
+                    help="markers: K markers in one <concept> pair; tags: K separate <concept>㈜</concept> blocks")
+    ap.add_argument("--separator", default="", help="string between repeated <concept> blocks (tags mode)")
+    ap.add_argument("--explain", action="store_true",
+                    help="add a system message explaining that the activation is duplicated")
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--batch-size", type=int, default=24)
     ap.add_argument("--max-new-tokens", type=int, default=300)
@@ -99,29 +113,69 @@ def main():
     inj_id = tm["injection_token_id"]
     left_id = tm["injection_left_neighbor_id"]
     right_id = tm["injection_right_neighbor_id"]
-    print(f"[meta] d={d_model} inj_scale={inj_scale} inj_char={inj_char!r}(id={inj_id}) K={K}")
+    print(f"[meta] d={d_model} inj_scale={inj_scale} inj_char={inj_char!r}(id={inj_id}) "
+          f"K={K} mode={args.repeat_mode} explain={args.explain}")
 
-    # Build the prompt with K marker chars inside the single <concept> tag pair.
-    base = av_template.format(injection_char=inj_char * K)
+    # Build the prompt.
+    if args.repeat_mode == "markers":
+        # K markers inside the single <concept> tag pair: <concept>㈜㈜…㈜</concept>
+        base = av_template.format(injection_char=inj_char * K)
+    else:
+        # K separate <concept>㈜</concept> blocks, joined by --separator.
+        tag_unit = f"<concept>{inj_char}</concept>"
+        base = av_template.format(injection_char=inj_char)
+        assert base.count(tag_unit) == 1, f"expected exactly one {tag_unit!r} in template"
+        base = base.replace(tag_unit, args.separator.join([tag_unit] * K))
+
+    # Optional system message explaining the duplication.
+    sys_msg = None
+    if args.explain:
+        sys_msg = (
+            f"The activation vector you must explain has been duplicated across {K} "
+            f"identical <concept> blocks in the input below. All {K} copies are the "
+            f"exact same vector; the repetition is only to make the signal more "
+            f"salient. Explain the single underlying activation as usual.")
 
     print(f"[load] {ckpt}")
     tok = AutoTokenizer.from_pretrained(str(ckpt), trust_remote_code=True)
+
+    # Some Gemma chat templates reject a `system` role; detect once and fall back
+    # to prepending the note to the user turn.
+    system_supported = True
+    if sys_msg is not None:
+        try:
+            tok.apply_chat_template(
+                [{"role": "system", "content": "x"}, {"role": "user", "content": "y"}],
+                tokenize=False, add_generation_prompt=True)
+        except Exception as e:
+            system_supported = False
+            print(f"[note] system role unsupported ({type(e).__name__}); merging into user turn")
+
+    def render(content):
+        if sys_msg is None:
+            msgs = [{"role": "user", "content": content}]
+        elif system_supported:
+            msgs = [{"role": "system", "content": sys_msg}, {"role": "user", "content": content}]
+        else:
+            msgs = [{"role": "user", "content": sys_msg + "\n\n" + content}]
+        return tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+
+    print(f"[load model] {ckpt}")
     model = AutoModelForCausalLM.from_pretrained(
         str(ckpt), torch_dtype=torch.bfloat16, trust_remote_code=True,
         attn_implementation="eager",
     ).to(args.device).eval()
     embed_layer = model.get_input_embeddings()  # built-in √d scaling for Gemma3
 
-    # Verify K markers tokenize as K separate inj_id tokens with right neighbors.
-    text0 = tok.apply_chat_template([{"role": "user", "content": base}],
-                                    tokenize=False, add_generation_prompt=True)
+    # Verify K markers tokenize as K inj_id tokens with correct neighbors.
+    text0 = render(base)
     ids0 = tok(text0, add_special_tokens=False)["input_ids"]
-    run0 = find_marker_run(ids0, inj_id, left_id, right_id, K)
+    run0 = find_marker_run(ids0, inj_id, left_id, right_id, K, args.repeat_mode)
     assert run0 is not None, (
-        f"K={K} markers did not tokenize as a clean run of {K} inj_id tokens "
+        f"K={K} ({args.repeat_mode}) did not tokenize as {K} inj_id tokens "
         f"bounded by left={left_id}/right={right_id}. "
         f"inj_id count={sum(1 for t in ids0 if t == inj_id)}")
-    print(f"[tok-check] K={K}: marker run at positions {run0} (len={len(run0)}), neighbors OK")
+    print(f"[tok-check] K={K} ({args.repeat_mode}): marker positions {run0}, neighbors OK")
 
     pr = pq.read_table(args.subset)
     sids = pr.column("sample_idx").to_pylist()
@@ -139,11 +193,9 @@ def main():
         for i in idxs:
             # Prompt content is identical across samples (the marker run); only
             # the injected vector differs. Render per-sample for safety.
-            content = base
-            text = tok.apply_chat_template([{"role": "user", "content": content}],
-                                           tokenize=False, add_generation_prompt=True)
+            text = render(base)
             ids = tok(text, add_special_tokens=False)["input_ids"]
-            run = find_marker_run(ids, inj_id, left_id, right_id, K)
+            run = find_marker_run(ids, inj_id, left_id, right_id, K, args.repeat_mode)
             if run is None:
                 continue
             ids_t = torch.tensor(ids, dtype=torch.long, device=args.device).unsqueeze(0)

@@ -224,32 +224,76 @@ above the mean baseline, let alone to Sonnet's level (~0.23) or the activation
 baseline (0.64). The bottleneck is the AV being OOD on text + a weak base, not
 the prompt.
 
-## 5c. Minor — repeating the injected activation token
+## 5c. Minor — can we *help* the AV read the activation? (repetition + few-shot)
 
-Another quick probe of the AV side: instead of the canonical single injection
-site `<concept>㈜</concept>`, render `<concept>㈜㈜…㈜</concept>` with **K copies
-of the marker** and overwrite *all K* token embeddings with the same
-(normalized, scaled) activation — still one `<concept>` tag pair. The thought:
-giving the AV the same vector at several positions might make the signal more
-salient / easier to attend to. K=1 reproduces the canonical AV exactly and is
-the internal control. All on the same 2,000 chat rows, AV sampled at temp=1.0
-and AR-rescored identically:
+A series of probes on the AV's input side, all asking the same question: the AV
+sees one activation injected into one `<concept>㈜</concept>` marker — can we do
+better by giving it the signal more prominently, or by showing it examples? The
+short answer across four rounds is **no**: every intervention is neutral at best
+and badly harmful at worst. All runs are on the **same 2,000 chat rows**, AV
+sampled at temp=1.0, AR-rescored identically; K=1 with no few-shot reproduces
+the canonical AV and is the control (FVE **+0.663** here; the §5b stored
+canonical is 0.635 on these rows — a ~3 pp offset from temp-1.0 re-sampling +
+the eager-attention AR pass, which cancels out of every *within-run*
+comparison).
 
-| K (repeated markers) | mse_nrm | FVE (vs mean act) | Δ FVE vs K=1 |
+**Round 1 — repeat the marker** (`<concept>㈜㈜…㈜</concept>`, K copies in one tag
+pair, same vector injected into all): **monotonically hurts.** FVE 0.663 (K=1) →
+0.653 (K=2) → 0.638 (K=4). The AV was trained on one marker; a contiguous run of
+identical activation embeddings is OOD positional structure and degrades it.
+
+**Round 2 — repeat the tag** (`<concept>㈜</concept><concept>㈜</concept>…`, K
+separate well-formed blocks): largely **removes** the round-1 penalty. Giving
+each copy its own in-distribution tag wrapper makes K=2 statistically
+indistinguishable from canonical:
+
+| K | repeat-marker (1 tag) | repeat-tag (K tags) | repeat-tag + system-prompt "explain" |
 |---|---|---|---|
-| **1** (canonical) | 0.01102 | **+0.663** | — |
-| 2 | 0.01134 | +0.653 | −0.010 |
-| 4 | 0.01185 | +0.638 | −0.025 |
+| 1 | +0.663 | +0.663 | — |
+| 2 | +0.653 | **+0.665** | +0.661 |
+| 4 | +0.638 | +0.654 | +0.645 |
 
-It **monotonically hurts** — each extra copy makes reconstruction slightly
-worse (~1 pp FVE at K=2, ~2.5 pp at K=4). Extra salience doesn't help; the AV
-was trained on exactly one marker, and the OOD positional structure of a run of
-identical activation embeddings degrades it instead. K=1 is optimal, so the
-curve would only fall further at higher K (not run). Net: leave the AV with the
-single-marker format it was trained on. (K=1 here scored +0.663 vs the §5b
-stored canonical 0.635 on identical rows — a ~3 pp offset from temp-1.0
-re-sampling + the eager-attention AR pass; the *within-run* K-sweep is the valid
-comparison and is unaffected by that offset.)
+A system-prompt sentence *explaining* that the activation is duplicated makes it
+slightly **worse** than plain tags (the RL-trained AV never saw a system prompt
+— extra OOD instruction text costs a little). Tag-wrapping is the best of the
+repetition variants but still never beats K=1.
+
+**Round 3 — high-K tag repetition** (K = 8, 16, 32), to check round 2 wasn't a
+low-K artifact. It isn't: on the shared 1,984 rows the decline is **monotonic
+all the way out**, and accelerates — FVE 0.688 (K=1) → 0.688 (K=2) → 0.684
+(K=4) → 0.679 (K=8) → 0.670 (K=16) → **0.652 (K=32)**. (Absolute FVE here is
+higher than the 2k-row numbers above because it's computed on a different shared
+row set that drops the few high-K parse failures; the *trend* is what matters.)
+K=2 is a genuine sweet spot where duplication is free; beyond that every
+doubling costs more. So redundant copies never add information, and eventually
+prompt length / OOD structure starts to bite.
+
+**Round 4 — few-shot prompting** (3 real `activation → canonical-explanation`
+demonstrations, drawn from rows outside the eval set, prepended as multi-turn
+context; every turn uses the same K-repeated `tags` layout so the shots
+demonstrate the query format). This is a **large net negative** at every K:
+
+| K | no few-shot (tags) | 3-shot few-shot |
+|---|---|---|
+| 1 | **+0.663** | **+0.460** |
+| 4 | +0.654 | +0.427 |
+| 8 | +0.629 | +0.430 |
+
+Few-shot alone (K=1) costs **~20 pp FVE**. The cause, visible directly in the
+generations, is **content contamination**: with three demonstrations in context,
+the AV bleeds the *shots'* content and phrasing into its explanation of the real
+activation instead of reading the query vector faithfully (e.g. a query whose
+real content is about a language model gets described in the wrestling-commentary
+style of shot #3). Repetition on top is irrelevant — the ~−2 pp K-effect is
+swamped by the ~−20 pp few-shot penalty.
+
+**Throughline.** The AV behaves like a saturated specialist: it extracts what it
+needs from a single, cleanly-formatted activation, and every attempt to "help"
+it — more copies, an explanation, in-context examples — is neutral (tag-wrapped
+K=2) to mildly harmful (more copies) to severely harmful (few-shot). The
+single-marker, zero-shot format it was trained on is optimal. See
+`figures/av_repeat_modes_fve.png` (rounds 1–2), `av_repeat_tags_highK_fve.png`
+(round 3), `av_fewshot_fve.png` (round 4).
 
 ---
 
@@ -313,7 +357,11 @@ comparison and is unaffected by that offset.)
   no injection (§5b).
 - `av_v4format_generate.py` — same but with the v4 few-shot scaffold (§5b).
 - `av_repeat_generate.py` / `score_repeat_ar.py` — inject the activation into K
-  repeated `<concept>` markers and AR-score (§5c).
+  repeated `<concept>` markers (marker or tag mode, optional system-prompt
+  "explain") and AR-score (§5c rounds 1–3).
+- `av_fewshot_repeat_generate.py` — few-shot AV: 3 real `activation→explanation`
+  shots (K-repeated tags) before the query, real activations injected per turn
+  (§5c round 4).
 - `plot_av_vs_avdelim_*.py`, `plot_av_on_text_hist.py` — mse and FVE histograms.
 - `figures/` — generated charts. `prompt.txt` — the hand-written v7 system
   prompt.
