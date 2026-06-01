@@ -224,12 +224,12 @@ above the mean baseline, let alone to Sonnet's level (~0.23) or the activation
 baseline (0.64). The bottleneck is the AV being OOD on text + a weak base, not
 the prompt.
 
-## 5c. Minor — can we *help* the AV read the activation? (repetition + few-shot)
+## 5c. Minor — can we *help* the AV read the activation? (repetition, few-shot, output-side refresh)
 
 A series of probes on the AV's input side, all asking the same question: the AV
 sees one activation injected into one `<concept>㈜</concept>` marker — can we do
 better by giving it the signal more prominently, or by showing it examples? The
-short answer across four rounds is **no**: every intervention is neutral at best
+short answer across five rounds is **no**: every intervention is neutral at best
 and badly harmful at worst. All runs are on the **same 2,000 chat rows**, AV
 sampled at temp=1.0, AR-rescored identically; K=1 with no few-shot reproduces
 the canonical AV and is the control (FVE **+0.663** here; the §5b stored
@@ -287,13 +287,54 @@ real content is about a language model gets described in the wrestling-commentar
 style of shot #3). Repetition on top is irrelevant — the ~−2 pp K-effect is
 swamped by the ~−20 pp few-shot penalty.
 
+**Round 5 — refresh the activation into the output stream.** Rounds 1–4 all
+touch the *prompt*. This one keeps the canonical single-marker prompt and instead
+re-injects the same activation into the residual stream (layer-0 embedding) of
+every *generated* token, to keep the signal salient as decoding proceeds —
+strength `alpha · decay(j)` of the injection scale (warm = 4 output tokens at
+peak, then exponential decay, tau = 8). alpha = 0 reproduces the canonical AV
+exactly: through the custom KV-cached decode loop it scores mse 0.0121 vs the
+`generate()`-based canonical K=1's 0.0119 (identical medians) — the loop is the
+control. This needs a manual decode loop, so the run is on a fresh **n = 500**
+chat subset; because the failure mode is parse-rate collapse rather than a smooth
+FVE shift, we report **coverage** (fraction still emitting a well-formed
+`<explanation>`) and **paired ΔMSE** on the rows parsed by *both* the variant and
+the alpha = 0 baseline (FVE-on-survivors would be selection-biased upward).
+
+The output-token embedding norm is ~60 while the injection scale is 80,000
+(≈1,300× larger), so there's a wide strength range to scan. The result is a clean
+dichotomy — **safe but inert, or registering but destructive:**
+
+| alpha | added-norm (×token) | coverage | paired ΔMSE vs baseline |
+|---|---|---|---|
+| 0.0005 | 0.7× | 100% | −0.0002 |
+| 0.002 | 2.7× | 100% | −0.0002 |
+| 0.005 | 6.7× | 99.6% | +0.0000 |
+| 0.01 | 13× | 35% | +0.0002\* |
+| 0.05 | 67× | 16% | +0.0004\* |
+| 0.2 | 267× | 8% | +0.0014\* |
+| 1.0 | 1333× | 12% | +0.0026\* |
+
+(\* paired on the biased survivor subset.) Up to alpha ≈ 0.005 the refresh is
+already ~7× the token's own embedding yet leaves reconstruction unchanged — paired
+ΔMSE within ±0.0002 of zero, win-rate **0.51** (a coin flip). The moment it is
+strong enough to register (alpha ≥ 0.01) it doesn't help, it *breaks decoding*:
+the persistent concept vector first stops the model from terminating the
+`<explanation>` (coverage 100 → 35%), then at higher strength corrupts the opening
+tokens into salad ("< of of of of …"). Variants meant to rescue this — refreshing
+only the first few tokens (`inject-steps` 4–8) or a constant gentle refresh over
+all tokens — change nothing: short-but-strong still loses coverage with ΔMSE ≈ 0
+on survivors, and constant-gentle (alpha = 0.002 over every token) is slightly
+*worse* (+0.0015). See `figures/av_refresh_fve.png`.
+
 **Throughline.** The AV behaves like a saturated specialist: it extracts what it
 needs from a single, cleanly-formatted activation, and every attempt to "help"
-it — more copies, an explanation, in-context examples — is neutral (tag-wrapped
-K=2) to mildly harmful (more copies) to severely harmful (few-shot). The
-single-marker, zero-shot format it was trained on is optimal. See
+it — more copies, an explanation, in-context examples, or re-injecting the vector
+as it writes — is neutral (tag-wrapped K=2; weak output-refresh) to mildly harmful
+(more copies) to severely harmful (few-shot; output-refresh strong enough to
+register). The single-marker, zero-shot format it was trained on is optimal. See
 `figures/av_repeat_modes_fve.png` (rounds 1–2), `av_repeat_tags_highK_fve.png`
-(round 3), `av_fewshot_fve.png` (round 4).
+(round 3), `av_fewshot_fve.png` (round 4), `av_refresh_fve.png` (round 5).
 
 ---
 
@@ -362,6 +403,10 @@ single-marker, zero-shot format it was trained on is optimal. See
 - `av_fewshot_repeat_generate.py` — few-shot AV: 3 real `activation→explanation`
   shots (K-repeated tags) before the query, real activations injected per turn
   (§5c round 4).
+- `av_refresh_generate.py` / `plot_av_refresh.py` — canonical single-marker
+  prompt, but re-inject the activation into each generated token's residual with
+  a decaying schedule (custom KV-cached decode loop); coverage + paired-ΔMSE
+  figure (§5c round 5).
 - `plot_av_vs_avdelim_*.py`, `plot_av_on_text_hist.py` — mse and FVE histograms.
 - `figures/` — generated charts. `prompt.txt` — the hand-written v7 system
   prompt.
