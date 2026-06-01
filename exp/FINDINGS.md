@@ -224,12 +224,12 @@ above the mean baseline, let alone to Sonnet's level (~0.23) or the activation
 baseline (0.64). The bottleneck is the AV being OOD on text + a weak base, not
 the prompt.
 
-## 5c. Minor — can we *help* the AV read the activation? (repetition, few-shot, output-side refresh)
+## 5c. Minor — can we *help* the AV read the activation? (repetition, few-shot, output-side refresh, attention bias)
 
 A series of probes on the AV's input side, all asking the same question: the AV
 sees one activation injected into one `<concept>㈜</concept>` marker — can we do
 better by giving it the signal more prominently, or by showing it examples? The
-short answer across five rounds is **no**: every intervention is neutral at best
+short answer across six rounds is **no**: every intervention is neutral at best
 and badly harmful at worst. All runs are on the **same 2,000 chat rows**, AV
 sampled at temp=1.0, AR-rescored identically; K=1 with no few-shot reproduces
 the canonical AV and is the control (FVE **+0.663** here; the §5b stored
@@ -327,14 +327,49 @@ all tokens — change nothing: short-but-strong still loses coverage with ΔMSE 
 on survivors, and constant-gentle (alpha = 0.002 over every token) is slightly
 *worse* (+0.0015). See `figures/av_refresh_fve.png`.
 
+**Round 6 — force attention to the marker(s) with an attention-logit bias.**
+Rounds 1–3 showed that *adding* copies of the activation (K tag blocks) is
+neutral-to-harmful — but maybe the copies don't help because the model never
+attends to them more. This round tests that directly: keep the K-tag layout and
+add a positive bias `b` to the pre-softmax attention logits at every marker key
+position, from every query position, in every layer (a gemma3 eager-attention
+patch — b = 0 reproduces the plain tags baseline, large b collapses attention onto
+the markers and yields token salad; both verified). Full K × b grid
+(K ∈ {1,2,4,8}, b ∈ {0,1,2,4}), n = 500.
+
+The round-5 selection-bias caveat bites hard here: raw means *look* like wins
+(e.g. K=4,b=1 mean 0.0099 vs the 0.0118 baseline) but that is entirely 1–4
+dropped high-MSE outliers — on the *matched* samples the baseline is also 0.0097.
+The honest paired measure is **win-rate** (fraction of matched rows where the
+biased variant beats the b = 0, K = 1 baseline):
+
+| b | K=1 | K=2 | K=4 | K=8 | coverage (K=8) |
+|---|---|---|---|---|---|
+| 0 | 0.50 | 0.46 | 0.40 | 0.40 | 100% |
+| 1 | 0.49 | 0.47 | 0.40 | 0.32 | 99% |
+| 2 | 0.38 | 0.33 | 0.29 | 0.18 | 98% |
+| 4 | 0.12 | 0.08 | 0.04 | 0.02 | 70% |
+
+Every cell is at or below 0.50 — the bias **never** helps — and it slides
+monotonically worse with both b and K, eventually collapsing coverage (K=8,b=4
+keeps only 70% well-formed; note even b = 0 reproduces the rounds-2/3 result that
+extra tags slightly hurt as K grows). Restricting the bias to the **upper half**
+of layers (to spare low-level token processing) unlocks nothing either: win-rate
+≤ 0.40 at b = 2 and it breaks even harder (b = 8 → 39–70% coverage, b = 16 → 0%).
+Forcing the model to look harder at the activation — even spread across K
+in-distribution copies — extracts no extra information; it only distorts the
+computation. See `figures/av_attnbias_fve.png`.
+
 **Throughline.** The AV behaves like a saturated specialist: it extracts what it
 needs from a single, cleanly-formatted activation, and every attempt to "help"
-it — more copies, an explanation, in-context examples, or re-injecting the vector
-as it writes — is neutral (tag-wrapped K=2; weak output-refresh) to mildly harmful
-(more copies) to severely harmful (few-shot; output-refresh strong enough to
-register). The single-marker, zero-shot format it was trained on is optimal. See
+it — more copies, an explanation, in-context examples, re-injecting the vector as
+it writes, or forcing attention onto the marker — is neutral (tag-wrapped K=2;
+weak output-refresh; b ≤ 1 bias) to mildly harmful (more copies) to severely
+harmful (few-shot; strong output-refresh or attention bias). The single-marker,
+zero-shot format it was trained on is optimal. See
 `figures/av_repeat_modes_fve.png` (rounds 1–2), `av_repeat_tags_highK_fve.png`
-(round 3), `av_fewshot_fve.png` (round 4), `av_refresh_fve.png` (round 5).
+(round 3), `av_fewshot_fve.png` (round 4), `av_refresh_fve.png` (round 5),
+`av_attnbias_fve.png` (round 6).
 
 ---
 
@@ -407,6 +442,10 @@ register). The single-marker, zero-shot format it was trained on is optimal. See
   prompt, but re-inject the activation into each generated token's residual with
   a decaying schedule (custom KV-cached decode loop); coverage + paired-ΔMSE
   figure (§5c round 5).
+- `av_attnbias_generate.py` / `plot_av_attnbias.py` — K-repeated activation tags
+  plus a pre-softmax attention-logit bias toward the markers (gemma3 eager-attn
+  patch, all / upper-half layers); K×b grid, paired win-rate + coverage figure
+  (§5c round 6).
 - `plot_av_vs_avdelim_*.py`, `plot_av_on_text_hist.py` — mse and FVE histograms.
 - `figures/` — generated charts. `prompt.txt` — the hand-written v7 system
   prompt.
