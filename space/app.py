@@ -48,7 +48,11 @@ MODELS = {
         "label": "Gemma-3-12B · AV layer 32",
         "n_layers": 48,      # base text layers -> hidden_states index range 0..48
         "av_layer": 32,      # AV training layer; default depth = av_layer + 1
-        "duration": 120,
+        # ZeroGPU multiplies this by `duration_factor` (=2 here) for the actual
+        # reservation, and anonymous (IP-quota) users have a low max. Real
+        # runtime is ~12-15s incl. cold GPU materialization, so 30s (→60s
+        # reserved) keeps logged-out users under the cap with headroom.
+        "duration": 30,
     },
     "27b": {
         "base": "google/gemma-3-27b-it",
@@ -273,8 +277,14 @@ def extract_soft_tokens(image: Image.Image, text_context: str, depth: int):
     img_mask = inputs["input_ids"][0] == st["image_token_id"]
     idxs = img_mask.nonzero(as_tuple=True)[0]
     vecs = h[idxs].float().cpu()                 # [n_img, d]
-    side = int(round(math.sqrt(vecs.shape[0])))
-    return vecs, side
+    # The UI grid is fixed at st["side"]×st["side"] and the click->index mapping
+    # assumes exactly that many tokens. do_pan_and_scan=False pins gemma-3 to
+    # 256; assert so any future drift fails loud instead of mis-indexing cells.
+    assert vecs.shape[0] == st["side"] ** 2, (
+        f"got {vecs.shape[0]} image tokens, expected {st['side'] ** 2} "
+        f"(pan&scan or multi-image?)"
+    )
+    return vecs, st["side"]
 
 
 def _blockquote(text: str) -> str:
@@ -317,7 +327,7 @@ def _cell_from_xy(xy, image: Image.Image, side: int) -> tuple[int, int, int]:
     return r * side + c, r, c
 
 
-def _report(depth, idx, row, col, nrm, text, cached) -> str:
+def _report(depth, idx, row, col, nrm, text, cached, scale) -> str:
     st = get_state()
     av_meta = st["av_meta"]
     where = (f"**mean of all {st['side'] ** 2} soft tokens**" if idx < 0
@@ -326,7 +336,7 @@ def _report(depth, idx, row, col, nrm, text, cached) -> str:
     head = (f"{where} · ‖v‖={nrm:.0f} · {badge}\n\n"
             f"<sub>`{CFG['label']}` · depth `hidden_states[{int(depth)}]` "
             f"(0 = raw soft tokens, {av_meta['layer_index'] + 1} = AV training "
-            f"layer) · injection_scale `{_resolve_scale(0):g}`</sub>\n\n")
+            f"layer) · injection_scale `{scale:g}`</sub>\n\n")
     return head + _blockquote(text)
 
 
@@ -335,20 +345,42 @@ def _resolve_scale(inj_scale) -> float:
     return float(inj_scale) if inj_scale and inj_scale > 0 else av_meta["injection_scale"]
 
 
+def _cache_sig(image: Image.Image, depth) -> str:
+    """Stable signature of image bytes + depth. Explanations are only valid for
+    the (image, depth) they were generated at; stored under '__sig__' so a stale
+    browser cache (e.g. a different image in another tab sharing localStorage)
+    can't serve wrong-image text for the same cell index."""
+    import hashlib
+    h = hashlib.md5(image.tobytes()).hexdigest()[:12]
+    return f"{h}:{int(depth)}"
+
+
+def _fresh_cache(cache, image, depth) -> dict:
+    """Return cache if it matches the current (image, depth) signature, else a
+    new cache carrying the current signature."""
+    cache = dict(cache or {})
+    sig = _cache_sig(image, depth)
+    if cache.get("__sig__") != sig:
+        return {"__sig__": sig}
+    return cache
+
+
 # ─── GPU work: encode (once, cached in State) + verbalise one target ───────────
 
 @spaces.GPU(duration=DURATION)
-def gpu_encode_verbalize(image, depth, vecs_np, idx, temperature,
+def gpu_encode_verbalize(image, depth, vstate, idx, temperature,
                          max_new_tokens, inj_scale):
-    """Returns (vecs_np, text, norm). Encodes the image to its 256 soft-token
-    vectors only if vecs_np is None (otherwise reuses the cached array), then
-    verbalises target `idx` (-1 == mean of all tokens)."""
+    """Returns ((depth, vecs_np), text, norm, scale). `vstate` is the prior
+    (encoded_depth, vecs_np) or None. The 256 vectors are reused across cells
+    ONLY if they were encoded at the current depth — making depth authoritative
+    regardless of event ordering (guards the depth-change-then-click race)."""
     get_state()  # ensure loaded; both models are already GPU-resident
     scale = _resolve_scale(inj_scale)
+    depth = int(depth)
 
-    # Encode the image only on the first click for this image+depth; the 256
-    # vectors are then reused across cells (passed back via server-side State).
-    if vecs_np is None:
+    if vstate is not None and vstate[0] == depth:
+        vecs_np = vstate[1]
+    else:
         vecs, _side = extract_soft_tokens(image, "", depth)
         vecs_np = vecs.numpy()
 
@@ -362,7 +394,7 @@ def gpu_encode_verbalize(image, depth, vecs_np, idx, temperature,
 
     text = verbalize(target, temperature=float(temperature),
                      max_new_tokens=int(max_new_tokens), inj_scale=scale)[0]
-    return vecs_np, text, nrm
+    return (depth, vecs_np), text, nrm, scale
 
 
 # ─── CPU event handlers (GPU is only touched on a cache miss) ──────────────────
@@ -390,40 +422,41 @@ def on_depth_change(image, depth):
             f"Cache cleared — next click re-encodes.")
 
 
-def on_click(evt: gr.SelectData, image, depth, vecs_np, cache,
+def on_click(evt: gr.SelectData, image, depth, vstate, cache,
              temperature, max_new_tokens, inj_scale):
     if image is None or evt is None or evt.index is None:
-        return gr.update(), gr.update(), vecs_np, cache or {}
+        return gr.update(), gr.update(), vstate, cache or {}
     side = get_state()["side"]
     idx, row, col = _cell_from_xy(evt.index, image, side)
-    cache = dict(cache or {})
+    cache = _fresh_cache(cache, image, depth)   # drop stale image/depth entries
     key = str(idx)
     hit = key in cache
     if hit:
         entry = cache[key]
-        text, nrm = entry["text"], entry["nrm"]
+        text, nrm, scale = entry["text"], entry["nrm"], entry["scale"]
     else:
-        vecs_np, text, nrm = gpu_encode_verbalize(
-            image, depth, vecs_np, idx, temperature, max_new_tokens, inj_scale)
-        cache[key] = {"text": text, "nrm": nrm}
+        vstate, text, nrm, scale = gpu_encode_verbalize(
+            image, depth, vstate, idx, temperature, max_new_tokens, inj_scale)
+        cache[key] = {"text": text, "nrm": nrm, "scale": scale}
     grid = draw_grid(image, side, highlight=(row, col))
-    return grid, _report(depth, idx, row, col, nrm, text, hit), vecs_np, cache
+    return grid, _report(depth, idx, row, col, nrm, text, hit, scale), vstate, cache
 
 
-def on_mean(image, depth, vecs_np, cache, temperature, max_new_tokens, inj_scale):
+def on_mean(image, depth, vstate, cache, temperature, max_new_tokens, inj_scale):
     if image is None:
-        return gr.update(), "Upload an image first.", vecs_np, cache or {}
+        return gr.update(), "Upload an image first.", vstate, cache or {}
     side = get_state()["side"]
-    cache = dict(cache or {})
+    cache = _fresh_cache(cache, image, depth)
     hit = "mean" in cache
     if hit:
-        text, nrm = cache["mean"]["text"], cache["mean"]["nrm"]
+        entry = cache["mean"]
+        text, nrm, scale = entry["text"], entry["nrm"], entry["scale"]
     else:
-        vecs_np, text, nrm = gpu_encode_verbalize(
-            image, depth, vecs_np, -1, temperature, max_new_tokens, inj_scale)
-        cache["mean"] = {"text": text, "nrm": nrm}
+        vstate, text, nrm, scale = gpu_encode_verbalize(
+            image, depth, vstate, -1, temperature, max_new_tokens, inj_scale)
+        cache["mean"] = {"text": text, "nrm": nrm, "scale": scale}
     grid = draw_grid(image, side, border=True)
-    return grid, _report(depth, -1, 0, 0, nrm, text, hit), vecs_np, cache
+    return grid, _report(depth, -1, 0, 0, nrm, text, hit, scale), vstate, cache
 
 
 # ─── UI ─────────────────────────────────────────────────────────────────────────
