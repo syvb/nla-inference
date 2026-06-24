@@ -27,12 +27,11 @@ import re
 from pathlib import Path
 
 import gradio as gr
-import numpy as np
 import spaces
 import torch
 import yaml
 from huggingface_hub import hf_hub_download, login
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from transformers import (
     AutoProcessor,
     AutoTokenizer,
@@ -134,15 +133,17 @@ def get_state() -> dict:
     ids = _to_id_list(ids)
     pos = _find_injection_pos(ids, av_meta)
 
+    mm = getattr(base.config, "mm_tokens_per_image", 256) or 256
     _STATE.update(
         base=base, processor=processor, av=av, av_tok=av_tok, av_meta=av_meta,
         av_prompt_ids=torch.tensor(ids, dtype=torch.long)[None],
         inj_pos=pos,
         n_layers=base.config.text_config.num_hidden_layers,
         image_token_id=base.config.image_token_index,
+        side=int(round(math.sqrt(mm))),   # 256 soft tokens -> 16x16 spatial grid
     )
     print(f"[load] done. layers={_STATE['n_layers']} d_model={av_meta['d_model']} "
-          f"inj_pos={pos} inj_scale={av_meta['injection_scale']}")
+          f"inj_pos={pos} inj_scale={av_meta['injection_scale']} side={_STATE['side']}")
     return _STATE
 
 
@@ -269,107 +270,158 @@ def extract_soft_tokens(image: Image.Image, text_context: str, depth: int):
     return vecs, side
 
 
-# ─── Token selection ────────────────────────────────────────────────────────────
-
-def select_cells(side: int, mode: str, grid_n: int):
-    """Returns list of (label, token_index) for the chosen verbalisation targets.
-    Cells are sampled on the side×side spatial grid in raster order."""
-    if mode == "Mean of all tokens":
-        return [("mean", -1)]
-    if mode.startswith("All"):
-        return [(f"r{i // side},c{i % side}", i) for i in range(side * side)]
-    # Downsampled grid
-    n = max(1, min(int(grid_n), side))
-    rows = sorted({int((i + 0.5) * side / n) for i in range(n)})
-    cols = sorted({int((j + 0.5) * side / n) for j in range(n)})
-    return [(f"r{r},c{c}", r * side + c) for r in rows for c in cols]
-
-
-def annotate(image: Image.Image, side: int, cells, mean_mode: bool) -> Image.Image:
-    """Overlay the side×side grid and highlight/number the selected cells."""
-    img = image.convert("RGB").copy()
-    W, H = img.size
-    draw = ImageDraw.Draw(img, "RGBA")
-    cw, ch = W / side, H / side
-    for k in range(side + 1):
-        draw.line([(k * cw, 0), (k * cw, H)], fill=(255, 255, 255, 60), width=1)
-        draw.line([(0, k * ch), (W, k * ch)], fill=(255, 255, 255, 60), width=1)
-    if mean_mode:
-        draw.rectangle([0, 0, W - 1, H - 1], outline=(255, 80, 80, 255), width=4)
-        return img
-    try:
-        font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(10, int(ch * 0.35)))
-    except Exception:
-        font = ImageFont.load_default()
-    for n, (_label, idx) in enumerate(cells):
-        r, c = idx // side, idx % side
-        x0, y0 = c * cw, r * ch
-        draw.rectangle([x0, y0, x0 + cw, y0 + ch],
-                       outline=(255, 200, 0, 255), width=2,
-                       fill=(255, 200, 0, 40))
-        draw.text((x0 + 3, y0 + 1), str(n), fill=(255, 80, 0, 255), font=font)
-    return img
-
-
-# ─── Main GPU pipeline ──────────────────────────────────────────────────────────
-
-@spaces.GPU(duration=DURATION)
-def run(image, mode, grid_n, depth, temperature, max_new_tokens,
-        inj_scale, text_context, seed):
-    if image is None:
-        return None, "Upload an image first."
-    if seed is not None and int(seed) >= 0:
-        torch.manual_seed(int(seed))
-
-    st = get_state()
-    av_meta = st["av_meta"]
-    inj_scale = float(inj_scale) if inj_scale and inj_scale > 0 else av_meta["injection_scale"]
-
-    base, av = st["base"], st["av"]
-
-    # Phase 1: encode image with the base model (base on GPU, AV on CPU).
-    base.to("cuda")
-    vecs, side = extract_soft_tokens(image, text_context, depth)
-    base.to("cpu")
-    torch.cuda.empty_cache()
-
-    cells = select_cells(side, mode, grid_n)
-    mean_mode = cells[0][1] == -1
-    if mean_mode:
-        targets = vecs.mean(0, keepdim=True)
-        norms = [vecs.norm(dim=-1).mean().item()]
-    else:
-        idxs = torch.tensor([i for _, i in cells])
-        targets = vecs[idxs]
-        norms = vecs[idxs].norm(dim=-1).tolist()
-
-    # Phase 2: verbalise with the AV (AV on GPU, base already off).
-    av.to("cuda")
-    texts = verbalize(targets, temperature=temperature,
-                      max_new_tokens=int(max_new_tokens), inj_scale=inj_scale)
-    av.to("cpu")
-    torch.cuda.empty_cache()
-
-    annotated = annotate(image, side, cells, mean_mode)
-
-    header = (
-        f"**{CFG['label']}** · {side}×{side} = {side * side} soft tokens · "
-        f"extraction depth `hidden_states[{int(depth)}]` "
-        f"(0 = raw soft tokens, {av_meta['layer_index'] + 1} = AV training layer) · "
-        f"injection_scale `{inj_scale:g}`\n\n"
-    )
-    lines = []
-    for n, ((label, _idx), text, nrm) in enumerate(zip(cells, texts, norms)):
-        tag = "**mean of 256 soft tokens**" if mean_mode else f"**{n}** · `{label}`"
-        lines.append(f"{tag} · ‖v‖={nrm:.0f}\n\n{_blockquote(text)}\n")
-    return annotated, header + "\n".join(lines)
-
-
 def _blockquote(text: str) -> str:
     """Prefix every line (incl. blank paragraph-break lines) with `>` so a
     multi-paragraph AV output stays inside one markdown blockquote."""
     return "\n".join(("> " + ln) if ln.strip() else ">"
                      for ln in text.strip().splitlines()) or "> (empty)"
+
+
+# ─── Grid drawing (CPU only — no model needed) ─────────────────────────────────
+
+def draw_grid(image: Image.Image, side: int,
+              highlight: tuple[int, int] | None = None,
+              border: bool = False) -> Image.Image:
+    """Overlay a side×side grid; optionally highlight one (row, col) cell, or
+    draw a full border (used for the whole-image mean)."""
+    img = image.convert("RGB").copy()
+    W, H = img.size
+    draw = ImageDraw.Draw(img, "RGBA")
+    cw, ch = W / side, H / side
+    for k in range(side + 1):
+        draw.line([(k * cw, 0), (k * cw, H)], fill=(255, 255, 255, 70), width=1)
+        draw.line([(0, k * ch), (W, k * ch)], fill=(255, 255, 255, 70), width=1)
+    if highlight is not None:
+        r, c = highlight
+        x0, y0 = c * cw, r * ch
+        draw.rectangle([x0, y0, x0 + cw, y0 + ch],
+                       outline=(255, 60, 0, 255), width=3, fill=(255, 160, 0, 80))
+    if border:
+        draw.rectangle([1, 1, W - 2, H - 2], outline=(255, 60, 0, 255), width=4)
+    return img
+
+
+def _cell_from_xy(xy, image: Image.Image, side: int) -> tuple[int, int, int]:
+    """Click pixel (x, y) -> (token_index, row, col) on the side×side grid."""
+    x, y = float(xy[0]), float(xy[1])
+    W, H = image.size
+    c = min(side - 1, max(0, int(x / (W / side))))
+    r = min(side - 1, max(0, int(y / (H / side))))
+    return r * side + c, r, c
+
+
+def _report(depth, idx, row, col, nrm, text, cached) -> str:
+    st = get_state()
+    av_meta = st["av_meta"]
+    where = (f"**mean of all {st['side'] ** 2} soft tokens**" if idx < 0
+             else f"**cell {idx}** · row {row}, col {col}")
+    badge = "↩︎ from cache" if cached else "✨ freshly generated"
+    head = (f"{where} · ‖v‖={nrm:.0f} · {badge}\n\n"
+            f"<sub>`{CFG['label']}` · depth `hidden_states[{int(depth)}]` "
+            f"(0 = raw soft tokens, {av_meta['layer_index'] + 1} = AV training "
+            f"layer) · injection_scale `{_resolve_scale(0):g}`</sub>\n\n")
+    return head + _blockquote(text)
+
+
+def _resolve_scale(inj_scale) -> float:
+    av_meta = get_state()["av_meta"]
+    return float(inj_scale) if inj_scale and inj_scale > 0 else av_meta["injection_scale"]
+
+
+# ─── GPU work: encode (once, cached in State) + verbalise one target ───────────
+
+@spaces.GPU(duration=DURATION)
+def gpu_encode_verbalize(image, depth, vecs_np, idx, temperature,
+                         max_new_tokens, inj_scale):
+    """Returns (vecs_np, text, norm). Encodes the image to its 256 soft-token
+    vectors only if vecs_np is None (otherwise reuses the cached array), then
+    verbalises target `idx` (-1 == mean of all tokens)."""
+    st = get_state()
+    base, av = st["base"], st["av"]
+    scale = _resolve_scale(inj_scale)
+
+    if vecs_np is None:
+        base.to("cuda")
+        vecs, _side = extract_soft_tokens(image, "", depth)
+        base.to("cpu")
+        torch.cuda.empty_cache()
+        vecs_np = vecs.numpy()
+
+    vecs_t = torch.from_numpy(vecs_np)
+    if idx is not None and idx >= 0:
+        target = vecs_t[idx:idx + 1]
+        nrm = float(vecs_t[idx].norm())
+    else:
+        target = vecs_t.mean(0, keepdim=True)
+        nrm = float(vecs_t.norm(dim=-1).mean())
+
+    av.to("cuda")
+    text = verbalize(target, temperature=float(temperature),
+                     max_new_tokens=int(max_new_tokens), inj_scale=scale)[0]
+    av.to("cpu")
+    torch.cuda.empty_cache()
+    return vecs_np, text, nrm
+
+
+# ─── CPU event handlers (GPU is only touched on a cache miss) ──────────────────
+
+def on_new_image(image):
+    """Upload/clear -> draw the grid instantly (no GPU) and reset both caches."""
+    if image is None:
+        return None, "Upload an image to begin.", None, {}
+    side = get_state()["side"]
+    grid = draw_grid(image, side)
+    msg = (f"### Click any cell to verbalise its soft token\n"
+           f"{side}×{side} = {side * side} image soft tokens. "
+           f"The first click encodes the image (~10–15s); later clicks reuse "
+           f"that encoding, and revisiting a cell is instant (cached).")
+    return grid, msg, None, {}          # grid, md, vecs_state(reset), cache(reset)
+
+
+def on_depth_change(image, depth):
+    """Depth changes the residual layer we read -> invalidate encoding + cache."""
+    if image is None:
+        return gr.update(), None, {}, gr.update()
+    side = get_state()["side"]
+    return (draw_grid(image, side), None, {},
+            f"Extraction depth set to `hidden_states[{int(depth)}]`. "
+            f"Cache cleared — next click re-encodes.")
+
+
+def on_click(evt: gr.SelectData, image, depth, vecs_np, cache,
+             temperature, max_new_tokens, inj_scale):
+    if image is None or evt is None or evt.index is None:
+        return gr.update(), gr.update(), vecs_np, cache or {}
+    side = get_state()["side"]
+    idx, row, col = _cell_from_xy(evt.index, image, side)
+    cache = dict(cache or {})
+    key = str(idx)
+    hit = key in cache
+    if hit:
+        entry = cache[key]
+        text, nrm = entry["text"], entry["nrm"]
+    else:
+        vecs_np, text, nrm = gpu_encode_verbalize(
+            image, depth, vecs_np, idx, temperature, max_new_tokens, inj_scale)
+        cache[key] = {"text": text, "nrm": nrm}
+    grid = draw_grid(image, side, highlight=(row, col))
+    return grid, _report(depth, idx, row, col, nrm, text, hit), vecs_np, cache
+
+
+def on_mean(image, depth, vecs_np, cache, temperature, max_new_tokens, inj_scale):
+    if image is None:
+        return gr.update(), "Upload an image first.", vecs_np, cache or {}
+    side = get_state()["side"]
+    cache = dict(cache or {})
+    hit = "mean" in cache
+    if hit:
+        text, nrm = cache["mean"]["text"], cache["mean"]["nrm"]
+    else:
+        vecs_np, text, nrm = gpu_encode_verbalize(
+            image, depth, vecs_np, -1, temperature, max_new_tokens, inj_scale)
+        cache["mean"] = {"text": text, "nrm": nrm}
+    grid = draw_grid(image, side, border=True)
+    return grid, _report(depth, -1, 0, 0, nrm, text, hit), vecs_np, cache
 
 
 # ─── UI ─────────────────────────────────────────────────────────────────────────
@@ -379,7 +431,8 @@ DESC = f"""# 🔍 NLA image soft-token verbaliser — {CFG['label']}
 Upload an image. **{CFG['base']}** encodes it into image *soft tokens* and runs
 them through its residual stream; the matching **NLA activation verbaliser**
 ([`{CFG['av']}`](https://huggingface.co/{CFG['av']})) then reads back what each
-vector "means" in natural language.
+vector "means" in natural language. **Click a grid cell** to verbalise that one
+soft token.
 
 ⚠️ **Expect weirdness.** The AV was trained to verbalise *text*-derived residual
 activations at one layer — never vision soft tokens. This is an out-of-distribution
@@ -391,20 +444,25 @@ failure mode, not a bug.
 def build():
     with gr.Blocks(title=f"NLA image verbaliser · {CFG['label']}") as demo:
         gr.Markdown(DESC)
+        # Server-side: the 256 encoded vectors for the current image+depth.
+        vecs_state = gr.State(None)
+        # Browser-side (localStorage): {token_idx -> {text, norm}} explanation
+        # cache. Reset whenever a new image is uploaded or depth changes.
+        # Fall back to server-side State if BrowserState is unavailable.
+        try:
+            cache_state = gr.BrowserState({}, storage_key=f"nla_av_cache_{KEY}")
+        except (AttributeError, TypeError) as e:
+            print(f"[warn] BrowserState unavailable ({e}); using server State")
+            cache_state = gr.State({})
         with gr.Row():
             with gr.Column(scale=1):
-                image = gr.Image(type="pil", label="Image")
-                mode = gr.Radio(
-                    ["Downsampled grid", "Mean of all tokens", "All tokens (slow)"],
-                    value="Downsampled grid", label="What to verbalise",
-                )
-                grid_n = gr.Slider(1, 16, value=4, step=1,
-                                   label="Grid size N (verbalises an N×N sample of cells)")
+                uploader = gr.Image(type="pil", sources=["upload", "clipboard"],
+                                    label="Upload / change image")
                 depth = gr.Slider(
-                    0, CFG["n_layers"],
-                    value=CFG["av_layer"] + 1, step=1,
+                    0, CFG["n_layers"], value=CFG["av_layer"] + 1, step=1,
                     label="Extraction depth (hidden_states index)",
                 )
+                mean_btn = gr.Button("Verbalise mean of all soft tokens")
                 with gr.Accordion("Generation / advanced", open=False):
                     temperature = gr.Slider(0.0, 1.5, value=1.0, step=0.05,
                                             label="Temperature (0 = greedy)")
@@ -412,19 +470,25 @@ def build():
                                                label="Max new tokens")
                     inj_scale = gr.Number(value=0, label="Injection-scale override "
                                           "(0 = use sidecar value)")
-                    text_context = gr.Textbox(value="", label="Optional text shown "
-                                              "with the image during encoding")
-                    seed = gr.Number(value=0, label="Seed (-1 = random)")
-                go = gr.Button("Verbalise", variant="primary")
+                gr.Markdown("*Changing temperature / max-tokens affects only "
+                            "newly generated cells; cached cells keep their text "
+                            "until you re-upload or change depth.*")
             with gr.Column(scale=1):
-                out_img = gr.Image(label="Selected soft-token cells", type="pil")
-                out_md = gr.Markdown()
-        go.click(
-            run,
-            [image, mode, grid_n, depth, temperature, max_new_tokens,
-             inj_scale, text_context, seed],
-            [out_img, out_md],
-        )
+                grid_img = gr.Image(type="pil", interactive=False,
+                                    label="Click a soft-token cell")
+                out_md = gr.Markdown("Upload an image to begin.")
+
+        gen_inputs = [temperature, max_new_tokens, inj_scale]
+        uploader.change(on_new_image, [uploader],
+                        [grid_img, out_md, vecs_state, cache_state])
+        depth.change(on_depth_change, [uploader, depth],
+                     [grid_img, vecs_state, cache_state, out_md])
+        grid_img.select(on_click,
+                        [uploader, depth, vecs_state, cache_state, *gen_inputs],
+                        [grid_img, out_md, vecs_state, cache_state])
+        mean_btn.click(on_mean,
+                       [uploader, depth, vecs_state, cache_state, *gen_inputs],
+                       [grid_img, out_md, vecs_state, cache_state])
     return demo
 
 
