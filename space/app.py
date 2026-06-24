@@ -9,7 +9,7 @@ This is firmly out-of-distribution: the AV was trained on text-derived residual
 activations at one specific layer, never on vision soft tokens. The point is to
 *look* at what falls out, not to expect fidelity.
 
-Two halves, never on the GPU at the same time (so the 27B pair fits in 70 GB):
+Two halves:
   1. EXTRACT  — base Gemma3ForConditionalGeneration encodes the image, we read
                 hidden_states[depth] at the 256 image-token positions.
   2. VERBALISE — the AV (text-only Gemma3ForCausalLM) injects each [d_model]
@@ -503,16 +503,12 @@ def on_mean(image, depth, vstate, cache, temperature, max_new_tokens, inj_scale)
 
 DESC = f"""# 🔍 NLA image soft-token verbaliser — {CFG['label']}
 
-Upload an image. **{CFG['base']}** encodes it into image *soft tokens* and runs
-them through its residual stream; the matching **NLA activation verbaliser**
-([`{CFG['av']}`](https://huggingface.co/{CFG['av']})) then reads back what each
-vector "means" in natural language. **Click a grid cell** to verbalise that one
-soft token.
+This encodes an uploaded image into soft tokens and then uses the Gemma NLA
+to verbalize what the model is thinking about when it looks at those image soft
+tokens. You can click on grid cells to verbalize the soft token at that grid cell.
 
-⚠️ **Expect weirdness.** The AV was trained to verbalise *text*-derived residual
-activations at one layer — never vision soft tokens. This is an out-of-distribution
-probe for curiosity, not a captioning tool. CJK / nonsense output is an expected
-failure mode, not a bug.
+This is OOD for the NLA as it wasn't trained on image inputs, but it does seem
+to have generalized somewhat well.
 """
 
 # Bundled sample images (downscaled to the 896px the vision encoder uses,
@@ -566,10 +562,6 @@ def build():
                     inputs=[uploader],
                     label="Or pick a provided image",
                 )
-                depth = gr.Slider(
-                    0, CFG["n_layers"], value=CFG["av_layer"] + 1, step=1,
-                    label="Extraction depth (hidden_states index)",
-                )
                 mean_btn = gr.Button("Verbalise mean of all soft tokens")
                 with gr.Accordion("Generation / advanced", open=False):
                     temperature = gr.Slider(0.0, 1.5, value=1.0, step=0.05,
@@ -578,6 +570,10 @@ def build():
                                                label="Max new tokens")
                     inj_scale = gr.Number(value=0, label="Injection-scale override "
                                           "(0 = use sidecar value)")
+                    depth = gr.Slider(
+                        0, CFG["n_layers"], value=CFG["av_layer"] + 1, step=1,
+                        label="Extraction depth (hidden_states index)",
+                    )
                 gr.Markdown("*Changing temperature / max-tokens affects only "
                             "newly generated cells; cached cells keep their text "
                             "until you re-upload or change depth.*")
