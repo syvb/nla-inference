@@ -133,6 +133,13 @@ def get_state() -> dict:
     ids = _to_id_list(ids)
     pos = _find_injection_pos(ids, av_meta)
 
+    # ZeroGPU: place both models on the GPU once. `spaces` defers the actual
+    # allocation to the first @spaces.GPU call and keeps the weights resident
+    # across calls, so per-click inference pays no CPU<->GPU transfer. Both 12B
+    # models (~48GB) fit together on the 70GB ZeroGPU H200, so no device-shuffle.
+    av.to("cuda")
+    base.to("cuda")
+
     mm = getattr(base.config, "mm_tokens_per_image", 256) or 256
     _STATE.update(
         base=base, processor=processor, av=av, av_tok=av_tok, av_meta=av_meta,
@@ -336,15 +343,13 @@ def gpu_encode_verbalize(image, depth, vecs_np, idx, temperature,
     """Returns (vecs_np, text, norm). Encodes the image to its 256 soft-token
     vectors only if vecs_np is None (otherwise reuses the cached array), then
     verbalises target `idx` (-1 == mean of all tokens)."""
-    st = get_state()
-    base, av = st["base"], st["av"]
+    get_state()  # ensure loaded; both models are already GPU-resident
     scale = _resolve_scale(inj_scale)
 
+    # Encode the image only on the first click for this image+depth; the 256
+    # vectors are then reused across cells (passed back via server-side State).
     if vecs_np is None:
-        base.to("cuda")
         vecs, _side = extract_soft_tokens(image, "", depth)
-        base.to("cpu")
-        torch.cuda.empty_cache()
         vecs_np = vecs.numpy()
 
     vecs_t = torch.from_numpy(vecs_np)
@@ -355,11 +360,8 @@ def gpu_encode_verbalize(image, depth, vecs_np, idx, temperature,
         target = vecs_t.mean(0, keepdim=True)
         nrm = float(vecs_t.norm(dim=-1).mean())
 
-    av.to("cuda")
     text = verbalize(target, temperature=float(temperature),
                      max_new_tokens=int(max_new_tokens), inj_scale=scale)[0]
-    av.to("cpu")
-    torch.cuda.empty_cache()
     return vecs_np, text, nrm
 
 
