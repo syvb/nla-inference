@@ -21,6 +21,8 @@ Which pair loads is chosen by the NLA_MODEL env var ("12b" | "27b").
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
 import re
@@ -397,14 +399,52 @@ def gpu_encode_verbalize(image, depth, vstate, idx, temperature,
     return (depth, vecs_np), text, nrm, scale
 
 
+@spaces.GPU(duration=DURATION)
+def gpu_precache(image, depth, start, count, temperature, max_new_tokens, inj_scale):
+    """Offline helper (hidden api_name='precache') used to build
+    examples/precache.json: verbalise cells [start, start+count) — or the mean
+    when start<0 — and return {hash, depth, cells}. `hash` is md5 of the
+    gradio-loaded image bytes, the exact key on_new_image looks up at runtime."""
+    get_state()
+    scale = _resolve_scale(inj_scale)
+    depth = int(depth)
+    vecs, _ = extract_soft_tokens(image, "", depth)
+    h = hashlib.md5(image.tobytes()).hexdigest()[:12]
+    start, count = int(start), int(count)
+    if start < 0:
+        text = verbalize(vecs.mean(0, keepdim=True), temperature=float(temperature),
+                         max_new_tokens=int(max_new_tokens), inj_scale=scale)[0]
+        cells = {"mean": {"text": text,
+                          "nrm": float(vecs.norm(dim=-1).mean()), "scale": scale}}
+    else:
+        e = min(start + count, vecs.shape[0])
+        texts = verbalize(vecs[start:e], temperature=float(temperature),
+                          max_new_tokens=int(max_new_tokens), inj_scale=scale)
+        norms = vecs[start:e].norm(dim=-1).tolist()
+        cells = {str(start + i): {"text": texts[i], "nrm": norms[i], "scale": scale}
+                 for i in range(e - start)}
+    return {"hash": h, "depth": depth, "cells": cells}
+
+
 # ─── CPU event handlers (GPU is only touched on a cache miss) ──────────────────
 
-def on_new_image(image):
-    """Upload/clear -> draw the grid instantly (no GPU) and reset both caches."""
+def on_new_image(image, depth):
+    """Upload/clear/example -> draw the grid instantly (no GPU) and reset caches.
+    For a bundled example at the precache depth, inject the precomputed cells so
+    every click is instant with zero GPU."""
     if image is None:
         return None, "Upload an image to begin.", None, {}
     side = get_state()["side"]
     grid = draw_grid(image, side)
+    h = hashlib.md5(image.tobytes()).hexdigest()[:12]
+    pc = PRECACHE.get(h)
+    if pc is not None and int(depth) == int(pc["depth"]):
+        cache = dict(pc["cells"])
+        cache["__sig__"] = f"{h}:{int(depth)}"
+        msg = (f"### Example image — all {side * side} cells precached ✨\n"
+               f"Click any cell (or **mean**) for an instant explanation. "
+               f"Changing depth explores other layers (generated on demand).")
+        return grid, msg, None, cache
     msg = (f"### Click any cell to verbalise its soft token\n"
            f"{side}×{side} = {side * side} image soft tokens. "
            f"The first click encodes the image (~10–15s); later clicks reuse "
@@ -483,6 +523,26 @@ EXAMPLES = [
 ]
 
 
+def _load_precache() -> dict:
+    """{img_hash: {"depth": int, "cells": {idx|"mean": {text,nrm,scale}}}} for the
+    bundled examples, generated offline via the gpu_precache endpoint. Empty if
+    absent (examples then fall back to on-demand generation)."""
+    p = Path(__file__).parent / "examples" / "precache.json"
+    if not p.exists():
+        return {}
+    try:
+        pc = json.loads(p.read_text())
+        print(f"[precache] loaded {len(pc)} example(s): "
+              f"{ {k: len(v['cells']) for k, v in pc.items()} }")
+        return pc
+    except Exception as e:  # pragma: no cover
+        print(f"[warn] precache load failed: {e}")
+        return {}
+
+
+PRECACHE = _load_precache()
+
+
 def build():
     with gr.Blocks(title=f"NLA image verbaliser · {CFG['label']}") as demo:
         gr.Markdown(DESC)
@@ -526,8 +586,20 @@ def build():
                                     label="Click a soft-token cell")
                 out_md = gr.Markdown("Upload an image to begin.")
 
+        # Hidden endpoint used offline to generate examples/precache.json
+        # (api_name='precache'); invisible, harmless to leave deployed.
+        pc_start = gr.Number(0, visible=False)
+        pc_count = gr.Number(16, visible=False)
+        pc_out = gr.JSON(visible=False)
+        pc_btn = gr.Button(visible=False)
+        pc_btn.click(
+            gpu_precache,
+            [uploader, depth, pc_start, pc_count, temperature, max_new_tokens, inj_scale],
+            [pc_out], api_name="precache",
+        )
+
         gen_inputs = [temperature, max_new_tokens, inj_scale]
-        uploader.change(on_new_image, [uploader],
+        uploader.change(on_new_image, [uploader, depth],
                         [grid_img, out_md, vecs_state, cache_state])
         depth.change(on_depth_change, [uploader, depth],
                      [grid_img, vecs_state, cache_state, out_md])
