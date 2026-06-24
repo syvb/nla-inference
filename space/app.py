@@ -475,6 +475,13 @@ probe for curiosity, not a captioning tool. CJK / nonsense output is an expected
 failure mode, not a bug.
 """
 
+# Bundled sample images (downscaled to the 896px the vision encoder uses,
+# metadata stripped). Paths are relative to the app root on the Space.
+EXAMPLES = [
+    ("examples/subway.jpg", "Subway"),
+    ("examples/breaker_panel.jpg", "Breaker panel"),
+]
+
 
 def build():
     with gr.Blocks(title=f"NLA image verbaliser · {CFG['label']}") as demo:
@@ -493,6 +500,12 @@ def build():
             with gr.Column(scale=1):
                 uploader = gr.Image(type="pil", sources=["upload", "clipboard"],
                                     label="Upload / change image")
+                gr.Examples(
+                    examples=[[p] for p, _ in EXAMPLES],
+                    example_labels=[lbl for _, lbl in EXAMPLES],
+                    inputs=[uploader],
+                    label="Or pick a provided image",
+                )
                 depth = gr.Slider(
                     0, CFG["n_layers"], value=CFG["av_layer"] + 1, step=1,
                     label="Extraction depth (hidden_states index)",
