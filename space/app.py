@@ -629,10 +629,6 @@ def build():
                         0, CFG["n_layers"], value=CFG["av_layer"] + 1, step=1,
                         label="Extraction depth (hidden_states index)",
                     )
-                gr.Markdown("*The cache is keyed by image, depth, and generation "
-                            "settings — changing temperature / max-tokens / "
-                            "injection-scale starts a fresh cache, so cells "
-                            "regenerate with the new settings.*")
             with gr.Column(scale=1):
                 grid_img = gr.Image(type="pil", interactive=False,
                                     label="Click a soft-token cell")
