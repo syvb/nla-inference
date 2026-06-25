@@ -251,17 +251,22 @@ def verbalize(vectors: torch.Tensor, *, temperature: float, max_new_tokens: int,
 # ─── Extraction (base multimodal side) ─────────────────────────────────────────
 
 @torch.inference_mode()
-def extract_soft_tokens(image: Image.Image, text_context: str, depth: int):
+def extract_soft_tokens(image: Image.Image, prefix_text: str, depth: int):
     """Returns (vectors[256, d] fp32 cpu, grid_side). Reads hidden_states[depth]
     at the image-token positions. depth=0 == the raw soft tokens (the projector
-    output that gets injected into the LM); depth=L+1 == output of block L."""
+    output that gets injected into the LM); depth=L+1 == output of block L.
+
+    `prefix_text` is placed BEFORE the image so it conditions the image-token
+    activations: Gemma-3 is causal, so image tokens attend to preceding text but
+    not following text. (Text after the image would not affect them at all.)"""
     st = get_state()
     base, proc = st["base"], st["processor"]
     dev = base.device
 
-    content = [{"type": "image", "image": image}]
-    if text_context.strip():
-        content.append({"type": "text", "text": text_context.strip()})
+    content = []
+    if prefix_text and prefix_text.strip():
+        content.append({"type": "text", "text": prefix_text.strip()})
+    content.append({"type": "image", "image": image})
     inputs = proc.apply_chat_template(
         [{"role": "user", "content": content}],
         add_generation_prompt=True, tokenize=True,
@@ -353,6 +358,12 @@ def _resolve_scale(inj_scale) -> float:
 PRECACHE_GEN = {"temperature": 1.0, "max_new_tokens": 400, "inj_scale": 0}
 
 
+def _prefix_hash(text) -> str:
+    """Hash of the (stripped) context text placed before the image. Empty text
+    hashes to a stable value, which is what the bundled precache was built with."""
+    return hashlib.md5((text or "").strip().encode()).hexdigest()[:8]
+
+
 def _gen_sig(temperature, max_new_tokens, inj_scale) -> str:
     """Canonical signature of the generation settings that affect the output
     text. Any change here must invalidate cached cells."""
@@ -360,38 +371,39 @@ def _gen_sig(temperature, max_new_tokens, inj_scale) -> str:
             f"_s{float(inj_scale):g}")
 
 
-def _cache_sig(image: Image.Image, depth, temperature, max_new_tokens,
-               inj_scale) -> str:
+def _cache_sig(image: Image.Image, depth, prefix_text, temperature,
+               max_new_tokens, inj_scale) -> str:
     """Signature of everything a cached explanation depends on: image bytes,
-    extraction depth, and the generation settings. Stored under '__sig__'; a
-    mismatch means the cached cells are stale (wrong image/depth/settings) and
-    must be discarded. Changing temperature / max-tokens / injection-scale now
-    invalidates the cache instead of silently serving old text."""
+    extraction depth, the context text placed before the image, and the
+    generation settings. Stored under '__sig__'; a mismatch means the cached
+    cells are stale and must be discarded."""
     h = hashlib.md5(image.tobytes()).hexdigest()[:12]
-    return f"{h}:{int(depth)}:{_gen_sig(temperature, max_new_tokens, inj_scale)}"
+    return (f"{h}:{int(depth)}:p{_prefix_hash(prefix_text)}:"
+            f"{_gen_sig(temperature, max_new_tokens, inj_scale)}")
 
 
-def _fresh_cache(cache, image, depth, temperature, max_new_tokens,
+def _fresh_cache(cache, image, depth, prefix_text, temperature, max_new_tokens,
                  inj_scale) -> dict:
     """Return cache if it matches the current signature, else a fresh cache
     carrying the current signature."""
     cache = dict(cache or {})
-    sig = _cache_sig(image, depth, temperature, max_new_tokens, inj_scale)
+    sig = _cache_sig(image, depth, prefix_text, temperature, max_new_tokens, inj_scale)
     if cache.get("__sig__") != sig:
         return {"__sig__": sig}
     return cache
 
 
-def _seed_cache(image, depth, temperature, max_new_tokens, inj_scale):
+def _seed_cache(image, depth, prefix_text, temperature, max_new_tokens, inj_scale):
     """Initial cache for a freshly shown image at the given settings, returned
     as (cache, precached?). If the image is a bundled example whose precache was
-    generated at exactly these settings (depth + generation params), inject the
-    precomputed cells; otherwise an empty cache carrying the signature."""
-    sig = _cache_sig(image, depth, temperature, max_new_tokens, inj_scale)
+    generated at exactly these settings (depth + generation params, and NO
+    prefix text), inject the precomputed cells; otherwise an empty cache."""
+    sig = _cache_sig(image, depth, prefix_text, temperature, max_new_tokens, inj_scale)
     h = sig.split(":", 1)[0]
     pc = PRECACHE.get(h)
     if pc is not None:
-        pc_sig = (f"{h}:{int(pc['depth'])}:" + _gen_sig(
+        # The precache was built with no prefix text.
+        pc_sig = (f"{h}:{int(pc['depth'])}:p{_prefix_hash('')}:" + _gen_sig(
             pc.get("temperature", PRECACHE_GEN["temperature"]),
             pc.get("max_new_tokens", PRECACHE_GEN["max_new_tokens"]),
             pc.get("inj_scale", PRECACHE_GEN["inj_scale"])))
@@ -405,20 +417,22 @@ def _seed_cache(image, depth, temperature, max_new_tokens, inj_scale):
 # ─── GPU work: encode (once, cached in State) + verbalise one target ───────────
 
 @spaces.GPU(duration=DURATION)
-def gpu_encode_verbalize(image, depth, vstate, idx, temperature,
+def gpu_encode_verbalize(image, depth, prefix_text, vstate, idx, temperature,
                          max_new_tokens, inj_scale):
-    """Returns ((depth, vecs_np), text, norm, scale). `vstate` is the prior
-    (encoded_depth, vecs_np) or None. The 256 vectors are reused across cells
-    ONLY if they were encoded at the current depth — making depth authoritative
-    regardless of event ordering (guards the depth-change-then-click race)."""
+    """Returns ((depth, prefix, vecs_np), text, norm, scale). `vstate` is the
+    prior (encoded_depth, encoded_prefix, vecs_np) or None. The 256 vectors are
+    reused across cells ONLY if they were encoded at the current depth AND the
+    current prefix text — making both authoritative regardless of event ordering
+    (guards the settings-change-then-click race)."""
     get_state()  # ensure loaded; both models are already GPU-resident
     scale = _resolve_scale(inj_scale)
     depth = int(depth)
+    prefix = (prefix_text or "").strip()
 
-    if vstate is not None and vstate[0] == depth:
-        vecs_np = vstate[1]
+    if vstate is not None and vstate[0] == depth and vstate[1] == prefix:
+        vecs_np = vstate[2]
     else:
-        vecs, _side = extract_soft_tokens(image, "", depth)
+        vecs, _side = extract_soft_tokens(image, prefix, depth)
         vecs_np = vecs.numpy()
 
     vecs_t = torch.from_numpy(vecs_np)
@@ -431,7 +445,7 @@ def gpu_encode_verbalize(image, depth, vstate, idx, temperature,
 
     text = verbalize(target, temperature=float(temperature),
                      max_new_tokens=int(max_new_tokens), inj_scale=scale)[0]
-    return (depth, vecs_np), text, nrm, scale
+    return (depth, prefix, vecs_np), text, nrm, scale
 
 
 @spaces.GPU(duration=DURATION)
@@ -465,7 +479,22 @@ def gpu_precache(image, depth, start, count, temperature, max_new_tokens, inj_sc
 
 # ─── CPU event handlers (GPU is only touched on a cache miss) ──────────────────
 
-def on_new_image(image, depth, temperature, max_new_tokens, inj_scale):
+def _seed_msg(side, precached, prefix_text):
+    ctx = (f" Context text **{prefix_text.strip()!r}** is prepended before the "
+           f"image, conditioning the activations." if prefix_text and prefix_text.strip()
+           else "")
+    if precached:
+        return (f"### Example image — all {side * side} cells precached ✨\n"
+                f"Click any cell (or **mean**) for an instant explanation. "
+                f"Changing depth, context text, or generation settings regenerates "
+                f"on demand.")
+    return (f"### Click any cell to verbalise its soft token\n"
+            f"{side}×{side} = {side * side} image soft tokens.{ctx} "
+            f"The first click encodes the image (~10–15s); later clicks reuse "
+            f"that encoding, and revisiting a cell is instant (cached).")
+
+
+def on_new_image(image, depth, prefix_text, temperature, max_new_tokens, inj_scale):
     """Upload/clear/example -> draw the grid instantly (no GPU) and (re)seed the
     cache. A bundled example whose precache matches the current settings gets its
     precomputed cells injected so every click is instant with zero GPU."""
@@ -473,40 +502,37 @@ def on_new_image(image, depth, temperature, max_new_tokens, inj_scale):
         return None, "Upload an image to begin.", None, {}
     side = get_state()["side"]
     grid = draw_grid(image, side)
-    cache, precached = _seed_cache(image, depth, temperature, max_new_tokens, inj_scale)
-    if precached:
-        msg = (f"### Example image — all {side * side} cells precached ✨\n"
-               f"Click any cell (or **mean**) for an instant explanation. "
-               f"Changing depth or generation settings regenerates on demand.")
-    else:
-        msg = (f"### Click any cell to verbalise its soft token\n"
-               f"{side}×{side} = {side * side} image soft tokens. "
-               f"The first click encodes the image (~10–15s); later clicks reuse "
-               f"that encoding, and revisiting a cell is instant (cached).")
-    return grid, msg, None, cache       # grid, md, vecs_state(reset), cache
+    cache, precached = _seed_cache(image, depth, prefix_text, temperature,
+                                   max_new_tokens, inj_scale)
+    return grid, _seed_msg(side, precached, prefix_text), None, cache
 
 
-def on_depth_change(image, depth, temperature, max_new_tokens, inj_scale):
-    """Depth changes the residual layer we read -> invalidate the encoding and
-    re-seed the cache (re-injecting the precache if settings line back up)."""
+def on_extract_change(image, depth, prefix_text, temperature, max_new_tokens, inj_scale):
+    """An extraction setting changed (depth or the context text before the image)
+    -> the encoding itself changes, so invalidate vecs_state and re-seed the cache
+    (re-injecting the precache only if everything lines back up to its params)."""
     if image is None:
         return gr.update(), None, {}, gr.update()
     side = get_state()["side"]
-    cache, precached = _seed_cache(image, depth, temperature, max_new_tokens, inj_scale)
+    cache, precached = _seed_cache(image, depth, prefix_text, temperature,
+                                   max_new_tokens, inj_scale)
+    ctx = (f", context {prefix_text.strip()!r}" if prefix_text and prefix_text.strip()
+           else ", no context text")
     note = ("all cells precached ✨" if precached
-            else "cache cleared — clicks regenerate at the new settings")
+            else "cache cleared — clicks re-encode at the new settings")
     return (draw_grid(image, side), None, cache,
-            f"Depth set to `hidden_states[{int(depth)}]` — {note}.")
+            f"Extraction: `hidden_states[{int(depth)}]`{ctx} — {note}.")
 
 
-def on_settings_change(image, depth, temperature, max_new_tokens, inj_scale):
+def on_settings_change(image, depth, prefix_text, temperature, max_new_tokens, inj_scale):
     """A generation setting changed -> re-seed the text cache (so stale cells are
     dropped and the precache re-injects when settings line back up). Leaves the
     image encoding (vecs_state) and the grid untouched."""
     if image is None:
         return gr.update(), gr.update()
     side = get_state()["side"]
-    cache, precached = _seed_cache(image, depth, temperature, max_new_tokens, inj_scale)
+    cache, precached = _seed_cache(image, depth, prefix_text, temperature,
+                                   max_new_tokens, inj_scale)
     if precached:
         msg = (f"### Example image — all {side * side} cells precached ✨\n"
                f"These settings match the precache, so every click is instant.")
@@ -516,14 +542,15 @@ def on_settings_change(image, depth, temperature, max_new_tokens, inj_scale):
     return msg, cache
 
 
-def on_click(evt: gr.SelectData, image, depth, vstate, cache,
+def on_click(evt: gr.SelectData, image, depth, prefix_text, vstate, cache,
              temperature, max_new_tokens, inj_scale):
     if image is None or evt is None or evt.index is None:
         return gr.update(), gr.update(), vstate, cache or {}
     side = get_state()["side"]
     idx, row, col = _cell_from_xy(evt.index, image, side)
-    # drop stale entries (wrong image / depth / generation settings)
-    cache = _fresh_cache(cache, image, depth, temperature, max_new_tokens, inj_scale)
+    # drop stale entries (wrong image / depth / context / generation settings)
+    cache = _fresh_cache(cache, image, depth, prefix_text, temperature,
+                         max_new_tokens, inj_scale)
     key = str(idx)
     hit = key in cache
     if hit:
@@ -531,24 +558,25 @@ def on_click(evt: gr.SelectData, image, depth, vstate, cache,
         text, nrm, scale = entry["text"], entry["nrm"], entry["scale"]
     else:
         vstate, text, nrm, scale = gpu_encode_verbalize(
-            image, depth, vstate, idx, temperature, max_new_tokens, inj_scale)
+            image, depth, prefix_text, vstate, idx, temperature, max_new_tokens, inj_scale)
         cache[key] = {"text": text, "nrm": nrm, "scale": scale}
     grid = draw_grid(image, side, highlight=(row, col))
     return grid, _report(depth, idx, row, col, nrm, text, hit, scale), vstate, cache
 
 
-def on_mean(image, depth, vstate, cache, temperature, max_new_tokens, inj_scale):
+def on_mean(image, depth, prefix_text, vstate, cache, temperature, max_new_tokens, inj_scale):
     if image is None:
         return gr.update(), "Upload an image first.", vstate, cache or {}
     side = get_state()["side"]
-    cache = _fresh_cache(cache, image, depth, temperature, max_new_tokens, inj_scale)
+    cache = _fresh_cache(cache, image, depth, prefix_text, temperature,
+                         max_new_tokens, inj_scale)
     hit = "mean" in cache
     if hit:
         entry = cache["mean"]
         text, nrm, scale = entry["text"], entry["nrm"], entry["scale"]
     else:
         vstate, text, nrm, scale = gpu_encode_verbalize(
-            image, depth, vstate, -1, temperature, max_new_tokens, inj_scale)
+            image, depth, prefix_text, vstate, -1, temperature, max_new_tokens, inj_scale)
         cache["mean"] = {"text": text, "nrm": nrm, "scale": scale}
     grid = draw_grid(image, side, border=True)
     return grid, _report(depth, -1, 0, 0, nrm, text, hit, scale), vstate, cache
@@ -617,6 +645,12 @@ def build():
                     inputs=[uploader],
                     label="Or pick a provided image",
                 )
+                prefix_text = gr.Textbox(
+                    value="", lines=2, label="Context text before the image (optional)",
+                    placeholder="e.g. \"Count the windows in this building.\" — text "
+                                "is prepended before the image so it conditions how "
+                                "the model looks at it. Press Enter to apply.",
+                )
                 mean_btn = gr.Button("Verbalise mean of all soft tokens")
                 with gr.Accordion("Generation / advanced", open=False):
                     temperature = gr.Slider(0.0, 1.5, value=1.0, step=0.05,
@@ -647,22 +681,25 @@ def build():
         )
 
         gen_inputs = [temperature, max_new_tokens, inj_scale]
-        seed_inputs = [uploader, depth, *gen_inputs]
+        seed_inputs = [uploader, depth, prefix_text, *gen_inputs]
+        click_inputs = [uploader, depth, prefix_text, vecs_state, cache_state, *gen_inputs]
         uploader.change(on_new_image, seed_inputs,
                         [grid_img, out_md, vecs_state, cache_state])
-        depth.change(on_depth_change, seed_inputs,
+        # Extraction settings (depth, context text) change the activations, so
+        # they invalidate the encoding (vecs_state) and re-seed the cache.
+        depth.change(on_extract_change, seed_inputs,
                      [grid_img, vecs_state, cache_state, out_md])
-        # Changing a generation setting re-seeds only the text cache + message
-        # (the image encoding in vecs_state doesn't depend on these, so it's
-        # preserved). Sliders fire on release to avoid thrashing during a drag.
+        prefix_text.submit(on_extract_change, seed_inputs,
+                           [grid_img, vecs_state, cache_state, out_md])
+        # Generation settings re-seed only the text cache + message (the image
+        # encoding doesn't depend on them). Sliders fire on release to avoid
+        # thrashing during a drag.
         temperature.release(on_settings_change, seed_inputs, [out_md, cache_state])
         max_new_tokens.release(on_settings_change, seed_inputs, [out_md, cache_state])
         inj_scale.change(on_settings_change, seed_inputs, [out_md, cache_state])
-        grid_img.select(on_click,
-                        [uploader, depth, vecs_state, cache_state, *gen_inputs],
+        grid_img.select(on_click, click_inputs,
                         [grid_img, out_md, vecs_state, cache_state])
-        mean_btn.click(on_mean,
-                       [uploader, depth, vecs_state, cache_state, *gen_inputs],
+        mean_btn.click(on_mean, click_inputs,
                        [grid_img, out_md, vecs_state, cache_state])
     return demo
 
